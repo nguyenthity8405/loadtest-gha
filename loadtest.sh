@@ -11,20 +11,32 @@
 #   LOADTEST_DURATION_SECS      default 120, HARD-CLAMPED to <= 540 so a run
 #                               fits the 10-minute Actions budget (visible in
 #                               the summary as duration=540 when clamped)
-#   LOADTEST_CONCURRENCY        default 4 — lanes; each paces rps/lanes req/s
-#   LOADTEST_MAX_ERROR_PERCENT  default 50 — exit 1 iff the error share
-#                               STRICTLY exceeds it (100 == 100 exits 0)
-#   LOADTEST_LOBBY_SCHEME       default derived: https, http for an IP:port target
-#   LOADTEST_LOBBY_HOST         default lobby.<env domain of target> — mirror
-#                               of internal/loadtest/lobby.go; when BOTH
-#                               scheme and host are set they win
+#   LOADTEST_CONCURRENCY        default 4 — lanes; each paces rps/lanes req/s;
+#                               CEILING of 64: above it is a config error
+#                               (exit 2 before any request), exactly 64 is
+#                               accepted
+#   LOADTEST_MAX_ERROR_PERCENT  default 50 (applied only when unset/empty) —
+#                               a NON-NEGATIVE integer; 0 is a legal value.
+#                               Exit 1 iff the error share STRICTLY exceeds
+#                               it (0 => ANY failure trips; 100 == 100 exits
+#                               0); a negative or non-numeric value is a
+#                               config error (exit 2 before any request)
+#   LOADTEST_LOBBY_SCHEME       default derived: http for an IP[:port] target,
+#                               https otherwise
+#   LOADTEST_LOBBY_HOST         default derived from LOADTEST_TARGET: an
+#                               IP[:port] target IS the lobby host itself over
+#                               http (mirror of the Go app's envDomain
+#                               fallback — no env domain, so no
+#                               lobby.<domain> derivation), any other target
+#                               gets lobby.<env domain>; when BOTH scheme and
+#                               host are set they win
 #   LOADTEST_PATH               default /api/v1/lobby-available-games?oc=demo&l=en
 #   LOADTEST_LOG                default loadtest-results.tsv — one
 #                               "<status>\t<time_total>" line per request
 #
 # Exit codes: 0 success; 1 error share exceeds the threshold; 2 config error
-# (non-positive / non-numeric RPS or concurrency — detected BEFORE any
-# request).
+# (non-positive / non-numeric RPS, concurrency outside 1..64, negative /
+# non-numeric MAX_ERROR_PERCENT — detected BEFORE any request).
 set -u
 
 err() { printf 'loadtest.sh: %s\n' "$*" >&2; }
@@ -43,6 +55,10 @@ LOG="${LOADTEST_LOG:-loadtest-results.tsv}"
 # ---- config validation (exit 2 BEFORE any request) --------------------------
 positive_number() { awk -v v="$1" 'BEGIN{exit !(v ~ /^[0-9]+(\.[0-9]+)?$/ && v+0 > 0)}' 2>/dev/null; }
 
+# dotted-quad IPv4 check (used for the lobby derivation below); awk's numeric
+# coercion also keeps absurd digit strings from overflowing shell arithmetic.
+is_ip() { awk -v v="$1" 'BEGIN{n = split(v, a, "."); if (n != 4) exit 1; for (i = 1; i <= 4; i++) if (a[i] !~ /^[0-9]+$/ || a[i] + 0 > 255) exit 1; exit 0}' 2>/dev/null; }
+
 if ! positive_number "$RPS"; then
   err "LOADTEST_RPS must be a positive number, got [$RPS]"
   exit 2
@@ -50,6 +66,10 @@ fi
 case "$LANES" in
   ''|*[!0-9]*) err "LOADTEST_CONCURRENCY must be a positive integer, got [$LANES]"; exit 2 ;;
 esac
+if ! awk -v v="$LANES" 'BEGIN{exit !(v + 0 <= 64)}'; then
+  err "LOADTEST_CONCURRENCY must be at most 64, got [$LANES]"
+  exit 2
+fi
 if [ "$LANES" -lt 1 ]; then
   err "LOADTEST_CONCURRENCY must be a positive integer, got [$LANES]"
   exit 2
@@ -57,20 +77,33 @@ fi
 case "$DUR" in ''|*[!0-9]*) DUR=120 ;; esac   # non-integer duration -> default
 [ "$DUR" -ge 1 ] || DUR=1
 [ "$DUR" -gt 540 ] && DUR=540                 # hard clamp: fit the 10-min Actions budget
-positive_number "$MAXERR" || MAXERR=50
+# Non-negative integer only: 0 is legal (ANY failure then trips the gate),
+# -5 / abc are config errors. The default above applies to unset/empty only.
+case "$MAXERR" in
+  ''|*[!0-9]*) err "LOADTEST_MAX_ERROR_PERCENT must be a non-negative integer, got [$MAXERR]"; exit 2 ;;
+esac
 
 # ---- lobby URL ---------------------------------------------------------------
 # Both scheme and host set explicitly => they win; otherwise each derives from
-# TARGET (https unless it is a bare IP:port; lobby.<env domain>, e.g.
-# apig.rg-lgna.com -> lobby.rg-lgna.com — same derivation as the Go app).
+# TARGET: an IP[:port] target is the lobby host itself over http (mirror of
+# the Go app's envDomain fallback — no env domain, so no lobby.<domain>), any
+# other target derives https and lobby.<env domain>, e.g. apig.rg-lgna.com ->
+# lobby.rg-lgna.com.
+TARGET_HOST="${TARGET%%:*}"
 if [ -z "$SCHEME" ]; then
   case "$TARGET" in
-    [0-9].[0-9].[0-9].[0-9]|*:[0-9]*) SCHEME=http ;;
-    *) SCHEME=https ;;
+    *:[0-9]*) SCHEME=http ;;
+    *)
+      if is_ip "$TARGET_HOST"; then SCHEME=http; else SCHEME=https; fi
+      ;;
   esac
 fi
 if [ -z "$HOST" ]; then
-  HOST="lobby.${TARGET#*.}"
+  if is_ip "$TARGET_HOST"; then
+    HOST="$TARGET"
+  else
+    HOST="lobby.${TARGET#*.}"
+  fi
 fi
 URL="$SCHEME://$HOST$REQ_PATH"
 
