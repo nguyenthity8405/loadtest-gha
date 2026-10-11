@@ -1,13 +1,14 @@
-# Runs the bash loadtest on every push. The 5-minute Fly cron
-# (scripts/gha-trigger.sh) pushes a `tmp` commit to fire it; workflow_dispatch
-# allows a manual run. 5 is replaced with LOADTEST_RPS from
-# deploy.env by scripts/gha-repo-sync.sh when this file is mirrored into the
-# runner repo — RPS has exactly one source of truth.
+# Runs the bash loadtest on every push to main or trigger. The 5-minute Fly
+# cron (scripts/gha-trigger.sh) pushes a `tmp` commit to `trigger` to fire it;
+# sync pushes land on main. workflow_dispatch allows a manual run.
+# 5 is replaced with LOADTEST_RPS from deploy.env by
+# scripts/gha-repo-sync.sh when this file is mirrored into the runner repo —
+# RPS has exactly one source of truth.
 name: loadtest
 
 on:
   push:
-    branches: ["**"]
+    branches: [main, trigger]
   workflow_dispatch:
 
 permissions:
@@ -27,3 +28,5 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: bash ./loadtest.sh
+    # Runs fire every 5 minutes forever; keep the log history short.
+    retention-days: 5
