@@ -11,8 +11,9 @@ exceeds `LOADTEST_MAX_ERROR_PERCENT`.
 How the cron triggers it: every 5 minutes a tiny Fly machine (app
 `gha-trigger`, `fly.gha-trigger.toml` in the source repo) runs
 `scripts/gha-trigger-loop.sh` → `scripts/gha-trigger.sh`, which pushes a `tmp`
-commit on the `trigger` branch through the GitHub Contents API. Every push
-fires the `loadtest` workflow on all branches. The run is capped at 10
+commit through the GitHub Contents API — on `main` in the deployed config
+(`GHA_BRANCH=main` app secret; the script default is `trigger`). Every push
+to `main` or `trigger` fires the `loadtest` workflow. The run is capped at 10
 minutes twice over: job-level `timeout-minutes: 10` plus a hard
 `LOADTEST_DURATION_SECS <= 540` clamp inside `loadtest.sh`.
 
@@ -25,8 +26,11 @@ Run it locally (no GitHub needed):
 
 ```bash
 LOADTEST_RPS=5 LOADTEST_DURATION_SECS=30 bash loadtest.sh
-# point at another host, tune the pass/fail gate:
-LOADTEST_TARGET=api.example.test LOADTEST_DURATION_SECS=60 \
+# point at another host, tune the pass/fail gate; an IP/hostname that is not
+# the production domain needs the lobby override (the derived
+# lobby.<env-domain> would never resolve):
+LOADTEST_TARGET=api.example.test LOADTEST_LOBBY_HOST=api.example.test \
+  LOADTEST_LOBBY_SCHEME=https LOADTEST_DURATION_SECS=60 \
   LOADTEST_MAX_ERROR_PERCENT=10 bash loadtest.sh
 ```
 
