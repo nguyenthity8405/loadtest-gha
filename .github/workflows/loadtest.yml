@@ -1,9 +1,11 @@
 # Runs the bash loadtest on every push to main or trigger. The 5-minute Fly
-# cron (scripts/gha-trigger.sh) pushes a `tmp` commit to `trigger` to fire it;
-# sync pushes land on main. workflow_dispatch allows a manual run.
-# 5 is replaced with LOADTEST_RPS from deploy.env by
-# scripts/gha-repo-sync.sh when this file is mirrored into the runner repo —
-# RPS has exactly one source of truth.
+# cron (scripts/gha-trigger.sh) pushes a `tmp` commit to fire it;
+# workflow_dispatch allows a manual run. The RPS placeholder in the env below
+# is replaced with LOADTEST_RPS from deploy.env by scripts/gha-repo-sync.sh
+# when this file is mirrored into the runner repo — RPS has exactly one
+# source of truth. (Job-level retention-days was tried here and GitHub
+# rejected the whole workflow with no jobs created — keep this file to the
+# proven key set.)
 name: loadtest
 
 on:
@@ -28,5 +30,3 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: bash ./loadtest.sh
-    # Runs fire every 5 minutes forever; keep the log history short.
-    retention-days: 5
