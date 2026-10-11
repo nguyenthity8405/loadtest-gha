@@ -27,6 +27,7 @@ jobs:
     env:
       LOADTEST_RPS: "5"
       LOADTEST_DURATION_SECS: "120"
+      LOADTEST_MIN_RPS_PERCENT: "50"
     steps:
       - uses: actions/checkout@v4
       - run: bash ./loadtest.sh
