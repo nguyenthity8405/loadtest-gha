@@ -21,6 +21,18 @@
 #                               it (0 => ANY failure trips; 100 == 100 exits
 #                               0); a negative or non-numeric value is a
 #                               config error (exit 2 before any request)
+#   LOADTEST_MIN_RPS_PERCENT    default 0 = DISABLED (today's behaviour
+#                               preserved exactly) — a NON-NEGATIVE INTEGER
+#                               percentage of LOADTEST_RPS.  When > 0 the run
+#                               exits 1 if the ACHIEVED rps= (the same number
+#                               the summary prints) is below LOADTEST_RPS *
+#                               percent / 100, so a throttled runner whose
+#                               requests all succeed cannot pass CI.  A
+#                               negative or non-numeric value is a config
+#                               error (exit 2 before any request).  The
+#                               summary line gains ONE trailing field,
+#                               minrps=<x.x> (the computed floor) or
+#                               minrps=off when disabled.
 #   LOADTEST_LOBBY_SCHEME       default derived: http for an IP[:port] target,
 #                               https otherwise
 #   LOADTEST_LOBBY_HOST         default derived from LOADTEST_TARGET: an
@@ -33,10 +45,29 @@
 #   LOADTEST_PATH               default /api/v1/lobby-available-games?oc=demo&l=en
 #   LOADTEST_LOG                default loadtest-results.tsv — one
 #                               "<status>\t<time_total>" line per request
+#   LOADTEST_GAME_PROBE_COUNT   default 3 — probes sent AFTER the lobby loop
+#                               completes (once per run, never per lane,
+#                               never DURING the loop), sequential and bounded
+#   LOADTEST_GAME_PROBE_SCHEME  default https
+#   LOADTEST_GAME_PROBE_HOST    default apig.rg-lgna.com
+#   LOADTEST_GAME_PROBE_CODE    default balonismo; an EXPLICITLY EMPTY value
+#                               disables the probe ("gameprobe: skipped", zero
+#                               probe requests); the run probes
+#                               <scheme>://<host>/<code>/config with the same
+#                               browser-header, -m 15 curl the lobby lanes use
+#   LOADTEST_GAME_PROBE_MAX_ERROR_PERCENT
+#                               unset/empty = REPORT-ONLY: the probe never
+#                               changes the exit code (the game-path 3000 wall
+#                               must be VISIBLE, not flapping the workflow
+#                               red); SET = exit 1 iff the game error share
+#                               STRICTLY exceeds it (the lobby gate's rule)
 #
-# Exit codes: 0 success; 1 error share exceeds the threshold; 2 config error
-# (non-positive / non-numeric RPS, concurrency outside 1..64, negative /
-# non-numeric MAX_ERROR_PERCENT — detected BEFORE any request).
+# Exit codes: 0 success; 1 error share exceeds the threshold (lobby, and the
+# game probe only when LOADTEST_GAME_PROBE_MAX_ERROR_PERCENT is set), OR the
+# achieved rps= falls below the throughput floor when LOADTEST_MIN_RPS_PERCENT
+# > 0; 2 config error (non-positive / non-numeric RPS, concurrency outside
+# 1..64, negative / non-numeric MAX_ERROR_PERCENT or MIN_RPS_PERCENT —
+# detected BEFORE any request).
 set -u
 
 err() { printf 'loadtest.sh: %s\n' "$*" >&2; }
@@ -47,10 +78,18 @@ RPS="${LOADTEST_RPS:-5}"
 LANES="${LOADTEST_CONCURRENCY:-4}"
 DUR="${LOADTEST_DURATION_SECS:-120}"
 MAXERR="${LOADTEST_MAX_ERROR_PERCENT:-50}"
+MINRPS="${LOADTEST_MIN_RPS_PERCENT:-0}"
 SCHEME="${LOADTEST_LOBBY_SCHEME:-}"
 HOST="${LOADTEST_LOBBY_HOST:-}"
 REQ_PATH="${LOADTEST_PATH:-/api/v1/lobby-available-games?oc=demo&l=en}"
 LOG="${LOADTEST_LOG:-loadtest-results.tsv}"
+GPROBE_COUNT="${LOADTEST_GAME_PROBE_COUNT:-3}"
+GPROBE_SCHEME="${LOADTEST_GAME_PROBE_SCHEME:-https}"
+GPROBE_HOST="${LOADTEST_GAME_PROBE_HOST:-apig.rg-lgna.com}"
+# '-' (NOT ':-'): an explicitly EMPTY code is the documented disable.
+GPROBE_CODE="${LOADTEST_GAME_PROBE_CODE-balonismo}"
+# Empty (= unset) means report-only; only a SET value gates the exit code.
+GPROBE_MAXERR="${LOADTEST_GAME_PROBE_MAX_ERROR_PERCENT-}"
 
 # ---- config validation (exit 2 BEFORE any request) --------------------------
 positive_number() { awk -v v="$1" 'BEGIN{exit !(v ~ /^[0-9]+(\.[0-9]+)?$/ && v+0 > 0)}' 2>/dev/null; }
@@ -82,6 +121,21 @@ case "$DUR" in ''|*[!0-9]*) DUR=120 ;; esac   # non-integer duration -> default
 case "$MAXERR" in
   ''|*[!0-9]*) err "LOADTEST_MAX_ERROR_PERCENT must be a non-negative integer, got [$MAXERR]"; exit 2 ;;
 esac
+# Same rule as MAX_ERROR_PERCENT: 0 (the default above, applied to
+# unset/empty only) DISABLES the throughput floor, any other non-negative
+# integer is a percentage of LOADTEST_RPS; -5 / abc are config errors.
+case "$MINRPS" in
+  ''|*[!0-9]*) err "LOADTEST_MIN_RPS_PERCENT must be a non-negative integer, got [$MINRPS]"; exit 2 ;;
+esac
+# The game probe's knobs get the same discipline (exit 2 before any request).
+case "$GPROBE_COUNT" in
+  ''|*[!0-9]*) err "LOADTEST_GAME_PROBE_COUNT must be a non-negative integer, got [$GPROBE_COUNT]"; exit 2 ;;
+esac
+if [ -n "$GPROBE_MAXERR" ]; then
+  case "$GPROBE_MAXERR" in
+    *[!0-9]*) err "LOADTEST_GAME_PROBE_MAX_ERROR_PERCENT must be a non-negative integer, got [$GPROBE_MAXERR]"; exit 2 ;;
+  esac
+fi
 
 # ---- lobby URL ---------------------------------------------------------------
 # Both scheme and host set explicitly => they win; otherwise each derives from
@@ -173,6 +227,59 @@ done
 pids=()
 trap - EXIT
 
+# ---- game-path probe --------------------------------------------------------
+# AFTER the lobby loop — once per run, never per lane, never DURING it — probe
+# <scheme>://<host>/<code>/config: the GHA egress (GitHub Azure AS8075) is the
+# only runtime still getting clean 200s, so this probe is the only sensor that
+# can surface the gateway's game-path "Error Code: 3000" verdict (a generic
+# HTTP 400 whose BODY carries the refusal) before the lobby itself fails.
+# Sequential and bounded: COUNT curls x the lanes' own -m 15 timeout.
+# Report-only by default; the exit-code effect is checked in the gate below.
+g_sent=0
+g_ok=0
+g_fail=0
+g_statuses=""
+g_bodies=""
+if [ -z "$GPROBE_CODE" ]; then
+  g_err_field="-"
+  printf 'gameprobe: skipped\n'
+else
+  g_url="$GPROBE_SCHEME://$GPROBE_HOST/$GPROBE_CODE/config"
+  g_i=0
+  while [ "$g_i" -lt "$GPROBE_COUNT" ]; do
+    g_i=$((g_i + 1))
+    g_raw="$(curl -sS -m 15 \
+      -A 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36' \
+      -H 'Accept: application/json, text/plain, */*' \
+      -H 'Accept-Language: en-US,en;q=0.9' \
+      -H "Referer: $GPROBE_SCHEME://$GPROBE_HOST/" \
+      -w '\n%{http_code}' \
+      "$g_url" 2>/dev/null)"
+    g_code="$(printf '%s\n' "$g_raw" | tail -n1)"
+    case "$g_code" in [0-9][0-9][0-9]) ;; *) g_code=000 ;; esac
+    # everything before the final "\n<code>" is the response body
+    g_body=""
+    case "$g_raw" in *$'\n'*) g_body="${g_raw%$'\n'*}" ;; esac
+    g_sent=$((g_sent + 1))
+    g_statuses="${g_statuses:+$g_statuses,}$g_code"
+    case "$g_code" in
+      2??) g_ok=$((g_ok + 1)) ;;
+      *)
+        g_fail=$((g_fail + 1))
+        # the verdict lives in the BODY (a generic 400 says nothing): keep the
+        # first ~40 chars of each non-2xx body, flattened to one line
+        g_snip="$(printf '%s' "$g_body" | tr '\n\r\t' '   ' | cut -c1-40)"
+        [ -n "$g_snip" ] || g_snip="-"
+        g_bodies="${g_bodies:+$g_bodies,}$g_snip"
+        ;;
+    esac
+  done
+  [ -n "$g_bodies" ] || g_bodies="-"
+  printf 'gameprobe: sent=%s ok=%s fail=%s statuses="%s" bodies="%s"\n' \
+    "$g_sent" "$g_ok" "$g_fail" "$g_statuses" "$g_bodies"
+  g_err_field="$(awk -v f="$g_fail" -v s="$g_sent" 'BEGIN{printf "%.1f", (s > 0) ? 100 * f / s : 0}')"
+fi
+
 # ---- summary -----------------------------------------------------------------
 # p50/p95 by nearest rank over the sorted per-request times; max is the last.
 tab="$(printf '\t')"
@@ -185,13 +292,31 @@ read -r sent ok fail p50 p95 pmax <<<"$(sort -t"$tab" -k2,2n "$LOG" | awk -F'\t'
   }')"
 rps="$(awk -v s="$sent" -v d="$DUR" 'BEGIN{printf "%.1f", (d > 0) ? s / d : 0}')"
 errpct="$(awk -v f="$fail" -v s="$sent" 'BEGIN{printf "%.1f", (s > 0) ? 100 * f / s : 0}')"
-printf 'summary: sent=%s ok=%s fail=%s duration=%s rps=%s err%%=%s p50=%s p95=%s max=%s\n' \
-  "$sent" "$ok" "$fail" "$DUR" "$rps" "$errpct" "$p50" "$p95" "$pmax"
+# Throughput floor: LOADTEST_RPS * percent / 100, one decimal — "off" when
+# MINRPS is 0 (the disabled default), so the summary always reports the gate.
+floor="$(awk -v r="$RPS" -v p="$MINRPS" 'BEGIN{if (p + 0 > 0) printf "%.1f", r * p / 100; else printf "off"}')"
+printf 'summary: sent=%s ok=%s fail=%s duration=%s rps=%s err%%=%s p50=%s p95=%s max=%s game_err%%=%s minrps=%s\n' \
+  "$sent" "$ok" "$fail" "$DUR" "$rps" "$errpct" "$p50" "$p95" "$pmax" "$g_err_field" "$floor"
 
 # STRICTLY exceeds the threshold => failure (100% errors with a threshold of
 # 100 does NOT exceed it).
 if awk -v f="$fail" -v s="$sent" -v m="$MAXERR" 'BEGIN{e = (s > 0) ? 100 * f / s : 0; exit !(e > m)}'; then
   err "error share exceeds LOADTEST_MAX_ERROR_PERCENT=$MAXERR"
+  exit 1
+fi
+# The game probe is REPORT-ONLY by default — the 3000 wall must be VISIBLE,
+# not flapping the workflow red against a wall the operators haven't moved
+# yet.  Only an explicitly SET threshold gates, with the lobby gate's STRICTLY
+# -exceeds rule (100% == 100 exits 0).
+if [ -n "$GPROBE_MAXERR" ] && awk -v f="$g_fail" -v s="$g_sent" -v m="$GPROBE_MAXERR" 'BEGIN{e = (s > 0) ? 100 * f / s : 0; exit !(e > m)}'; then
+  err "game probe error share exceeds LOADTEST_GAME_PROBE_MAX_ERROR_PERCENT=$GPROBE_MAXERR"
+  exit 1
+fi
+# Throughput gate: a THROTTLED runner whose requests all succeed (err%=0.0)
+# must not pass CI.  Compared against the printed rps= itself, so the gate and
+# the summary never disagree; floor=off (MINRPS=0) skips the gate entirely.
+if [ "$floor" != off ] && ! awk -v a="$rps" -v f="$floor" 'BEGIN{exit !(a + 0 >= f + 0)}'; then
+  err "achieved rps $rps is below the throughput floor $floor (LOADTEST_MIN_RPS_PERCENT=$MINRPS of LOADTEST_RPS=$RPS)"
   exit 1
 fi
 exit 0
