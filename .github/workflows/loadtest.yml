@@ -30,3 +30,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: bash ./loadtest.sh
+      # Keep every run's raw results so runs can be compared over time.
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: loadtest-results
+          path: loadtest-results.tsv
+          if-no-files-found: ignore
+          retention-days: 5
