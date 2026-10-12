@@ -424,7 +424,17 @@ function applyStake(state, text) {
 // ~3 game-path slots instead of the observed ~40% of the run.
 export const GAME_WALL_CONSECUTIVE = 3;
 
-const WALL_MARKERS = ['Error Code: 3000', 'Error processing your request'];
+// The DISCRIMINATING wall marker. The gateway's other error text — the
+// generic "Error processing your request" envelope — also wraps ordinary
+// wallet, session and provider verdicts (loadtest-stderr.log:2276 shows
+// "...Insufficient balance" inside it; provider-403-game-never-banned.md
+// documents a 403 carrying the phrase on a healthy egress). The phrase alone
+// must NOT count toward degradation: 3 consecutive wallet verdicts would flip
+// wall.degraded and silently end the run's spin coverage on a HEALTHY egress.
+// Only "Error Code: 3000" identifies the egress wall. worker/catalog.js
+// keeps the phrase too, but there it feeds classify → 'unverified' (the safe
+// direction — it never bans a game), never a degradation trigger.
+export const WALL_MARKERS = ['Error Code: 3000'];
 
 // isWallBody: the two WAF signatures — the HTML wall page and the JSON
 // gateway variant ("code":3000) Go's stats tests pin.
