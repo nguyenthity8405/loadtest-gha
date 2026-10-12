@@ -1,4 +1,4 @@
-# Runs the bash loadtest on every push to main or trigger. The 5-minute Fly
+# Runs the Node loadtest on every push to main or trigger. The 5-minute Fly
 # cron (scripts/gha-trigger.sh) pushes a `tmp` commit to fire it;
 # workflow_dispatch allows a manual run. The RPS placeholder in the env below
 # is replaced with LOADTEST_RPS from deploy.env by scripts/gha-repo-sync.sh
@@ -36,7 +36,7 @@ jobs:
       LOADTEST_BROKER_SECRET: "${{ secrets.GHA_BROKER_SECRET }}"
     steps:
       - uses: actions/checkout@v4
-      - run: bash ./loadtest.sh
+      - run: node ./loadtest.mjs
       # Keep every run's raw results so runs can be compared over time.
       - if: always()
         uses: actions/upload-artifact@v4
