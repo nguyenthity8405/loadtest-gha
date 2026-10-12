@@ -28,6 +28,12 @@ jobs:
       LOADTEST_RPS: "5"
       LOADTEST_DURATION_SECS: "120"
       LOADTEST_MIN_RPS_PERCENT: "50"
+      # Token leg: acquire ONE player token from the broker (mint-first, so the
+      # runner never mints from GitHub egress) and drive the apig read-data
+      # APIs with it. The URL is public; the secret is a GitHub Actions secret
+      # (never in this file, never in the repo) injected at run time.
+      LOADTEST_TOKEN_URL: "https://tokenbroker.fly.dev/token"
+      LOADTEST_BROKER_SECRET: "${{ secrets.GHA_BROKER_SECRET }}"
     steps:
       - uses: actions/checkout@v4
       - run: bash ./loadtest.sh
