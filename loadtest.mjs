@@ -21,6 +21,14 @@
 // The bash version ran the read mix even on source=mint — it could never
 // spin, which is exactly the defect this file exists to remove.
 //
+// Orthogonal to (and layered ON TOP of) that rule: GAME_WALL_CONSECUTIVE
+// game-path responses carrying the WAF "Error Code: 3000" signature degrade
+// the WHOLE run to lobby-only for the remainder — GitHub's egress is walled
+// on the game path while the lobby host stays reachable
+// (docs/bug-20261012-gha-keeps-firing-a-walled-game-path.md). mix= still
+// names the source-selected mode; the summary reports the degradation as
+// wall=game-path.
+//
 // The runner NEVER mints (/client/player/fun-mode-token) and never holds a
 // fleet token: supply is one broker acquisition before the run.
 //
@@ -400,6 +408,39 @@ function applyStake(state, text) {
   state.betLevel = minPositive(v?.betLevels) ?? 1;
 }
 
+// ── the game-path egress wall ─────────────────────────────────────────────
+// GitHub's Azure egress (AS8075) is WAF-blocked on the GAME PATH: every apig
+// game request answers the gateway's "Error Code: 3000" wall (HTTP 400/403
+// with that body) while the LOBBY host stays reachable — a live run summary
+// read sent=427 ok=288 fail=139 err%=32.6 mix=full game_err%=100.0, i.e. ~40%
+// of the budget fired at a surface that provably refuses this egress BEFORE
+// the request is sent. Same principle as Go's callReadOnly and the error-rate
+// rotation guard (internal/loadtest/games.go): never keep sending to a
+// surface that has PROVEN it will refuse you.
+//
+// GAME_WALL_CONSECUTIVE = 3: high enough that a single flaky 400 (or a
+// wallet/session verdict 400 — those are NOT walls) cannot degrade a healthy
+// run, low enough that a walled run stops burning its doomed budget within
+// ~3 game-path slots instead of the observed ~40% of the run.
+export const GAME_WALL_CONSECUTIVE = 3;
+
+const WALL_MARKERS = ['Error Code: 3000', 'Error processing your request'];
+
+// isWallBody: the two WAF signatures — the HTML wall page and the JSON
+// gateway variant ("code":3000) Go's stats tests pin.
+export function isWallBody(text) {
+  return typeof text === 'string' && WALL_MARKERS.some((m) => text.includes(m));
+}
+
+// isWallResponse: the signature must ride the wall's OWN statuses (400/403).
+// Status alone judges nothing — a 400 "Insufficient balance" is a wallet
+// verdict, not an egress verdict — and the body alone judges nothing either.
+// Deliberately narrow: a non-wall 400/403 resets the consecutive counter
+// instead of counting toward degradation.
+export function isWallResponse(res) {
+  return !!res && (res.status === 400 || res.status === 403) && isWallBody(res.text);
+}
+
 // ── URLs (verbatim shapes from the Go call sites — PROVEN on the gateway) ──
 const balanceUrl = (ctx) => `${ctx.api}/api/v2/balance?oc=${ctx.cfg.ocs}&t=${ctx.token}`;
 const historyUrl = (ctx) => {
@@ -553,16 +594,26 @@ async function runLane(ctx, idx, deadline) {
   let rr = idx; // read-mode rotation offset, seeded by the lane index (de-phased lanes)
   const intervalMs = (ctx.cfg.lanes / ctx.cfg.rps) * 1000;
 
-  if (ctx.mode === 'full') {
+  if (ctx.mode === 'full' && !ctx.wall.degraded) {
     // Bootstrap like Go's worker: authorize once per lane, then load the
-    // stake config; both are real requests and both are recorded.
+    // stake config; both are real requests and both are recorded. Skipped
+    // when a sibling lane already proved the wall — a doomed bootstrap
+    // cannot help anyone.
     await doAuthorize(ctx, state);
     await doConfig(ctx, state);
   }
 
   while (Date.now() < deadline) {
     if (ctx.token) ctx.rollWindow(idx);
-    if (ctx.mode === 'full') {
+    if (ctx.wall.degraded) {
+      // wall-detected → lobby-only: the orthogonal, one-way fallback on top
+      // of the three-level rule (full|read → wall → lobby, mirroring mint-
+      // empty → read-only). The slot still issues a REAL request on the
+      // reachable surface, so sent/rps/err% stay the true accounting of what
+      // was actually sent — the doomed game-path requests stop, nothing is
+      // hidden.
+      await doLobby(ctx);
+    } else if (ctx.mode === 'full') {
       const action = pickAction(rng);
       if (action === 'spin') {
         if (state.noBalance) {
@@ -661,9 +712,36 @@ export async function runLoadtest({ env = {}, fetchFn, out, errOut, acquireDelay
     }
   };
   const referer = `${cfg.scheme}://${cfg.host}/`;
+  // ── game-path wall detection ─────────────────────────────────────────────
+  // Run-level state, like Go's error-rate rotation guard: the wall is a fact
+  // about THIS EGRESS, not about one lane, so the lanes that prove it degrade
+  // every lane. The counter is shared across lanes; a healthy game-path
+  // answer resets it, lobby answers never touch it (they are the reachable
+  // surface, not evidence). Best-effort under concurrency by design: the live
+  // wall refuses 100% of game-path requests, so interleaving never hides it.
+  const wall = { consecutive: 0, degraded: false };
+  // The lobby-catalog path (on its derived host, and on the apig host as the
+  // doLobby transport fallback) is the reachable surface — never judged.
+  const isLobbyUrl = (url) => url === cfg.lobbyUrl || url === cfg.lobbyFallbackUrl;
+  const noteWall = (url, res) => {
+    if (wall.degraded || isLobbyUrl(url)) return;
+    if (isWallResponse(res)) {
+      wall.consecutive += 1;
+      if (wall.consecutive >= GAME_WALL_CONSECUTIVE) {
+        wall.degraded = true;
+        fail(`game-path egress wall detected (${GAME_WALL_CONSECUTIVE} consecutive "Error Code: 3000" refusals) — degrading to lobby-only for the rest of the run`);
+      }
+    } else {
+      wall.consecutive = 0;
+    }
+  };
   const send = async (url, opts = {}) => {
     const res = await httpRequest(fetchFn, url, { ...opts, headers: browserHeaders(referer, opts.headers ?? {}) });
     record(res.status, res.secs);
+    // Detection runs AFTER the record: every pre-detection request stays
+    // counted truthfully — the wall stops FUTURE doomed requests, it never
+    // hides past ones.
+    noteWall(url, res);
     return res;
   };
 
@@ -671,6 +749,7 @@ export async function runLoadtest({ env = {}, fetchFn, out, errOut, acquireDelay
     cfg,
     token,
     mode,
+    wall,
     send,
     api: `${cfg.readScheme}://${cfg.readHost}`,
     window: () => window,
@@ -727,8 +806,9 @@ export async function runLoadtest({ env = {}, fetchFn, out, errOut, acquireDelay
 
   // ── summary ─────────────────────────────────────────────────────────────
   // p50/p95 by nearest rank over the sorted per-request times; max is the
-  // last. Fields APPEND, never reorder: the trailing minrps=/token= and the
-  // new mix= (full|read|lobby — the mode, never the token).
+  // last. Fields APPEND, never reorder: the trailing minrps=/token=/mix=
+  // (full|read|lobby — the mode, never the token) and the wall= verdict
+  // (none|game-path — WHY the game share dropped, when it did).
   const sent = records.length;
   const okCount = records.filter((r) => r.status >= 200 && r.status < 300).length;
   const failCount = sent - okCount;
@@ -743,7 +823,8 @@ export async function runLoadtest({ env = {}, fetchFn, out, errOut, acquireDelay
   log(
     `summary: sent=${sent} ok=${okCount} fail=${failCount} duration=${cfg.dur} rps=${rpsPrinted} err%=${errPct.toFixed(1)} ` +
       `p50=${rank(0.5).toFixed(3)} p95=${rank(0.95).toFixed(3)} max=${sent === 0 ? '0.0' : times[times.length - 1].toFixed(3)} ` +
-      `game_err%=${gErrField} minrps=${floor === null ? 'off' : floor.toFixed(1)} token=${tokenSrc} mix=${mode}`,
+      `game_err%=${gErrField} minrps=${floor === null ? 'off' : floor.toFixed(1)} token=${tokenSrc} mix=${mode} ` +
+      `wall=${wall.degraded ? 'game-path' : 'none'}`,
   );
 
   // ── gates (STRICTLY exceeds, bash parity: 100% errors with a threshold of
