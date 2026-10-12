@@ -136,6 +136,20 @@ positive_number() { awk -v v="$1" 'BEGIN{exit !(v ~ /^[0-9]+(\.[0-9]+)?$/ && v+0
 # coercion also keeps absurd digit strings from overflowing shell arithmetic.
 is_ip() { awk -v v="$1" 'BEGIN{n = split(v, a, "."); if (n != 4) exit 1; for (i = 1; i <= 4; i++) if (a[i] !~ /^[0-9]+$/ || a[i] + 0 > 255) exit 1; exit 0}' 2>/dev/null; }
 
+# THE http-vs-https rule, in exactly ONE place (review S8): an IP[:port] or
+# any explicitly ported target is http, an IP host without a port is http,
+# every other target is https.  Both derivations — the lobby URL's SCHEME and
+# the read APIs' READ_SCHEME — call this, so a rule change is a single edit
+# and the two can never drift apart.
+derive_scheme() { # <target> — prints "http" or "https"
+  case "$1" in
+    *:[0-9]*) printf 'http' ;;
+    *)
+      if is_ip "${1%%:*}"; then printf 'http'; else printf 'https'; fi
+      ;;
+  esac
+}
+
 if ! positive_number "$RPS"; then
   err "LOADTEST_RPS must be a positive number, got [$RPS]"
   exit 2
@@ -183,12 +197,7 @@ fi
 # lobby.rg-lgna.com.
 TARGET_HOST="${TARGET%%:*}"
 if [ -z "$SCHEME" ]; then
-  case "$TARGET" in
-    *:[0-9]*) SCHEME=http ;;
-    *)
-      if is_ip "$TARGET_HOST"; then SCHEME=http; else SCHEME=https; fi
-      ;;
-  esac
+  SCHEME="$(derive_scheme "$TARGET")"
 fi
 if [ -z "$HOST" ]; then
   if is_ip "$TARGET_HOST"; then
@@ -216,6 +225,10 @@ PLAYER_TOKEN=""   # acquired token; empty = lobby-only (unset or degraded)
 TOKEN_SRC="none"  # what the summary reports: mint|store|none — never the token
 READ_START=""     # the UTC+7 operator-day window the history/details reads
 READ_END=""       # need (the Go app's betsWindow), %-escaped like QueryEscape
+READ_DAY=""       # that operator day (YYYY-MM-DD in UTC+7) — recomputed when
+                  # the lane loop sees it roll (review S7)
+READ_ROLLOVER=""  # UTC epoch of the NEXT operator-day midnight: once now >=
+                  # this, the lane loop recomputes the window mid-run
 
 # Fail-fast on a config combination that can only ever fail: a broker URL with
 # REQUIRE_TOKEN=1 but no secret means the broker 401s every attempt, so the run
@@ -228,13 +241,10 @@ if [ -n "$TOKEN_URL" ] && [ "$REQUIRE_TOKEN" = "1" ] && [ -z "$BROKER_SECRET" ];
 fi
 
 # The read APIs live on the API host (LOADTEST_TARGET itself — Go's apiHost),
-# NOT on the derived lobby host; the scheme follows the same rule the lobby
-# derivation uses (http for an IP[:port] target, https otherwise).
+# NOT on the derived lobby host; the scheme is the SAME rule the lobby
+# derivation uses, via the one derive_scheme helper (review S8).
 READ_HOST="$TARGET"
-case "$TARGET" in
-  *:[0-9]*) READ_SCHEME=http ;;
-  *) if is_ip "${TARGET%%:*}"; then READ_SCHEME=http; else READ_SCHEME=https; fi ;;
-esac
+READ_SCHEME="$(derive_scheme "$TARGET")"
 
 acquire_token() { # bounded, retrying; sets PLAYER_TOKEN + TOKEN_SRC, rc 1 on failure
   local attempt raw code body tok src
@@ -270,37 +280,63 @@ acquire_token() { # bounded, retrying; sets PLAYER_TOKEN + TOKEN_SRC, rc 1 on fa
   return 1
 }
 
+# The operator's day in UTC+7 — the Go app's betsWindow: start = that day's
+# 17:00:00.000Z, end = the next day's 16:59:59.999Z, computed with GNU date.
+# The explicit "UTC" anchors keep the arithmetic free of the runner's TZ.
+# Called ONCE before the run, then AGAIN from inside the lane loop whenever
+# the operator day has rolled past READ_ROLLOVER (review S7): Go recomputes
+# betsWindow() per call, so a run crossing UTC+7 midnight must roll too
+# instead of sending the previous operator day for its remaining minutes.
+# Sets READ_DAY / READ_START / READ_END / READ_ROLLOVER only on SUCCESS; on
+# failure it returns 1 and leaves any previous window fully intact — never a
+# half-set one.
+compute_read_window() {
+  local day read_start read_end read_epoch
+  day="$(date -u -d '+7 hours' '+%Y-%m-%d' 2>/dev/null || true)"
+  case "$day" in
+    [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9])
+      read_start="$(date -u -d "$day 00:00:00 UTC -7 hours" '+%Y-%m-%dT%H:%M:%S' 2>/dev/null || true)"
+      read_end="$(date -u -d "$day 00:00:00 UTC +17 hours -1 second" '+%Y-%m-%dT%H:%M:%S' 2>/dev/null || true)"
+      # the rollover instant = local midnight + one local day.  An epoch this
+      # system cannot produce only DISABLES the mid-run recompute — the
+      # window itself is still good, so it is never a computation failure.
+      read_epoch="$(date -u -d "$day 00:00:00 UTC -7 hours" '+%s' 2>/dev/null || true)"
+      case "$read_epoch" in ''|*[!0-9]*) read_epoch="" ;; esac
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+  [ -n "$read_start" ] && [ -n "$read_end" ] || return 1
+  READ_DAY="$day"
+  READ_START="$(printf '%s.000Z' "$read_start" | sed 's/:/%3A/g')"
+  READ_END="$(printf '%s.999Z' "$read_end" | sed 's/:/%3A/g')"
+  if [ -n "$read_epoch" ]; then
+    READ_ROLLOVER=$((read_epoch + 86400))
+  else
+    READ_ROLLOVER=""
+  fi
+  return 0
+}
+
 if [ -n "$TOKEN_URL" ]; then
   if acquire_token; then
-    # The operator's day in UTC+7 — the Go app's betsWindow: start = today's
-    # 17:00:00.000Z, end = tomorrow's 16:59:59.999Z, computed with GNU date.
-    # The explicit "UTC" anchors keep the arithmetic free of the runner's TZ.
-    read_day="$(date -u -d '+7 hours' '+%Y-%m-%d' 2>/dev/null || true)"
-    read_start=""
-    read_end=""
-    case "$read_day" in
-      [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9])
-        read_start="$(date -u -d "$read_day 00:00:00 UTC -7 hours" '+%Y-%m-%dT%H:%M:%S' 2>/dev/null || true)"
-        read_end="$(date -u -d "$read_day 00:00:00 UTC +17 hours -1 second" '+%Y-%m-%dT%H:%M:%S' 2>/dev/null || true)"
-        ;;
-    esac
-    if [ -n "$read_start" ] && [ -n "$read_end" ]; then
-      READ_START="$(printf '%s.000Z' "$read_start" | sed 's/:/%3A/g')"
-      READ_END="$(printf '%s.999Z' "$read_end" | sed 's/:/%3A/g')"
-    elif [ "$REQUIRE_TOKEN" = 1 ]; then
-      # LOADTEST_REQUIRE_TOKEN=1 => exit 2 BEFORE any request on ANY
-      # acquisition-side failure (review W7): a token whose operator-day
-      # window cannot be computed is as unusable as a failed acquisition, so
-      # it gets the same fatal verdict — never a silent degrade that leaves
-      # REQUIRE_TOKEN=1 running a tokenless lobby-only run green.
-      err "could not compute the UTC+7 read window and LOADTEST_REQUIRE_TOKEN=1"
-      exit 2
-    else
-      # a token without its window cannot drive history/details correctly:
-      # fail safe back to today's lobby-only behavior, never a malformed read
-      err "could not compute the UTC+7 read window - degrading to lobby-only (token=none)"
-      PLAYER_TOKEN=""
-      TOKEN_SRC="none"
+    if ! compute_read_window; then
+      if [ "$REQUIRE_TOKEN" = 1 ]; then
+        # LOADTEST_REQUIRE_TOKEN=1 => exit 2 BEFORE any request on ANY
+        # acquisition-side failure (review W7): a token whose operator-day
+        # window cannot be computed is as unusable as a failed acquisition, so
+        # it gets the same fatal verdict — never a silent degrade that leaves
+        # REQUIRE_TOKEN=1 running a tokenless lobby-only run green.
+        err "could not compute the UTC+7 read window and LOADTEST_REQUIRE_TOKEN=1"
+        exit 2
+      else
+        # a token without its window cannot drive history/details correctly:
+        # fail safe back to today's lobby-only behavior, never a malformed read
+        err "could not compute the UTC+7 read window - degrading to lobby-only (token=none)"
+        PLAYER_TOKEN=""
+        TOKEN_SRC="none"
+      fi
     fi
   elif [ "$REQUIRE_TOKEN" = 1 ]; then
     err "token acquisition from LOADTEST_TOKEN_URL failed and LOADTEST_REQUIRE_TOKEN=1"
@@ -329,13 +365,32 @@ now() { # fractional epoch (integer fallback where %N is unsupported)
   esac
 }
 
+# <lane-index> — the index seeds this lane's read-mix round-robin offset
+# (review S9), so lanes never all start on the same endpoint class and the
+# mix hits them out of phase instead of in lockstep.
 lane() {
-  local out last code t now_s rem d url rn=0
+  local out last code t now_s now_i rem d url
+  local idx="${1:-0}" rn="${1:-0}"
   while :; do
     now_s="$(now)"
     awk -v a="$now_s" -v b="$DEADLINE" 'BEGIN{exit !(a < b)}' || break
     url="$URL"
     if [ -n "$PLAYER_TOKEN" ]; then
+      # review S7: the operator day may roll past UTC+7 midnight mid-run
+      # (a run is up to 540 s, so a run can straddle 17:00 UTC).  Go's
+      # betsWindow() recomputes PER CALL — recompute here too, or the run's
+      # remaining minutes keep sending yesterday's operator day.  The guard
+      # is a pure integer compare against the epoch already derived for the
+      # window: zero extra forks per request, and the (two-fork) recompute
+      # itself runs only when the day has actually moved.  On a failed
+      # recompute the PREVIOUS window stays in force — never a malformed one.
+      if [ -n "$READ_ROLLOVER" ]; then
+        now_i="${now_s%%.*}"
+        case "$now_i" in ''|*[!0-9]*) now_i=0 ;; esac
+        if [ "$now_i" -ge "$READ_ROLLOVER" ] && compute_read_window; then
+          log "read window rolled to the new UTC+7 operator day $READ_DAY (lane $idx)"
+        fi
+      fi
       # Read mix: each request takes the NEXT endpoint round-robin — balance,
       # history, details, config, then the tokenless lobby catalog, cycling.
       # The raw token lives only in these request URLs, never in script output.
@@ -383,7 +438,7 @@ DEADLINE="$(awk -v s="$(now)" -v d="$DUR" 'BEGIN{printf "%.3f", s + d}')"
 log "loadtest start: $URL rps=$RPS lanes=$LANES duration=${DUR}s (target=$TARGET)"
 
 for ((i = 1; i <= LANES; i++)); do
-  lane &
+  lane "$i" &   # the index seeds the lane's round-robin offset (review S9)
   pids+=($!)
 done
 for p in ${pids[@]+"${pids[@]}"}; do
