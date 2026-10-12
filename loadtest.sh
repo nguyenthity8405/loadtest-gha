@@ -61,14 +61,52 @@
 #                               must be VISIBLE, not flapping the workflow
 #                               red); SET = exit 1 iff the game error share
 #                               STRICTLY exceeds it (the lobby gate's rule)
+#   LOADTEST_TOKEN_URL          unset/empty = today's lobby-only behavior
+#                               EXACTLY (no acquisition, no read mix; the
+#                               summary still reports token=none); SET = ONE
+#                               player token is acquired from the broker's
+#                               /token BEFORE the run and each request
+#                               round-robins the READ-DATA endpoints the Go
+#                               app drives with a token — balance
+#                               (/api/v2/balance?oc=&t=), history (/api/bets),
+#                               details (/api/total-bets), config
+#                               (/<code>/config) — plus the tokenless lobby
+#                               catalog.  A read-only run NEVER spins
+#                               (/<code>/spin) or mints
+#                               (/client/player/fun-mode-token).  The summary
+#                               gains a trailing token=<mint|store|none>
+#                               (the SOURCE only — the raw token never
+#                               appears in the summary or any script-emitted
+#                               line, only inside request URLs)
+#   LOADTEST_BROKER_SECRET      sent as `Authorization: Bearer <secret>` on
+#                               the acquisition call
+#   LOADTEST_REQUIRE_TOKEN      default 0: acquisition failure DEGRADES to
+#                               lobby-only (a warning, token=none, exit code
+#                               unchanged); 1: acquisition failure OR a
+#                               UTC+7 read-window computation failure is
+#                               exit 2 BEFORE any request
+#   LOADTEST_GAME_CODE          default fortune-dragon — the gameCode the
+#                               read APIs need
+#   LOADTEST_OCS                default demo — the operator code (oc= /
+#                               brandCode=)
 #
 # Exit codes: 0 success; 1 error share exceeds the threshold (lobby, and the
 # game probe only when LOADTEST_GAME_PROBE_MAX_ERROR_PERCENT is set), OR the
 # achieved rps= falls below the throughput floor when LOADTEST_MIN_RPS_PERCENT
 # > 0; 2 config error (non-positive / non-numeric RPS, concurrency outside
 # 1..64, negative / non-numeric MAX_ERROR_PERCENT or MIN_RPS_PERCENT —
-# detected BEFORE any request).
+# detected BEFORE any request), ALSO when LOADTEST_REQUIRE_TOKEN=1 and the
+# token acquisition failed or the UTC+7 read window could not be computed
+# (also BEFORE any request).
 set -u
+# Numbers here are dot-decimal by contract: curl emits %{time_total} as
+# 0.123456, and awk's printf "%.3f" builds the pacing sleeps and the summary's
+# rps/err%/p50/p95/max. Under a comma-decimal locale (de_DE, vi_VN, …) bash's
+# printf rejects the dot form ("invalid number") and awk emits commas, so the
+# TSV and the summary silently corrupt. The workflow's env -i masks this by
+# forcing C, but an operator running the script by hand must get the same
+# numbers — so pin the C locale here, where the next reader will look.
+export LC_ALL=C
 
 err() { printf 'loadtest.sh: %s\n' "$*" >&2; }
 log() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
@@ -161,6 +199,117 @@ if [ -z "$HOST" ]; then
 fi
 URL="$SCHEME://$HOST$REQ_PATH"
 
+# ---- token broker + read-data mix (docs/spec-20261012-token-broker.md) -------
+# LOADTEST_TOKEN_URL unset/empty => today's lobby-only behavior exactly.  Set
+# => ONE player token is acquired from the broker BEFORE the run (bounded
+# curl, a couple of retries, sed-parsed JSON — NO jq) and the lane loop
+# round-robins the READ-DATA endpoints with it.  The raw token never appears
+# in any script-emitted line; the summary only names the SOURCE.  Failure
+# degrades to lobby-only with a warning (exit code unchanged) unless
+# LOADTEST_REQUIRE_TOKEN=1 makes it fatal — exit 2 BEFORE any request.
+TOKEN_URL="${LOADTEST_TOKEN_URL:-}"
+BROKER_SECRET="${LOADTEST_BROKER_SECRET:-}"
+REQUIRE_TOKEN="${LOADTEST_REQUIRE_TOKEN:-0}"
+GAME_CODE="${LOADTEST_GAME_CODE:-fortune-dragon}"
+OCS="${LOADTEST_OCS:-demo}"
+PLAYER_TOKEN=""   # acquired token; empty = lobby-only (unset or degraded)
+TOKEN_SRC="none"  # what the summary reports: mint|store|none — never the token
+READ_START=""     # the UTC+7 operator-day window the history/details reads
+READ_END=""       # need (the Go app's betsWindow), %-escaped like QueryEscape
+
+# Fail-fast on a config combination that can only ever fail: a broker URL with
+# REQUIRE_TOKEN=1 but no secret means the broker 401s every attempt, so the run
+# would burn its acquisition retries and then exit 2 anyway. Catch it BEFORE
+# any request so the operator gets the reason immediately. (Without
+# REQUIRE_TOKEN=1 an empty secret is legal — it just degrades to lobby-only.)
+if [ -n "$TOKEN_URL" ] && [ "$REQUIRE_TOKEN" = "1" ] && [ -z "$BROKER_SECRET" ]; then
+  err "LOADTEST_TOKEN_URL is set with REQUIRE_TOKEN=1 but LOADTEST_BROKER_SECRET is empty — the broker would 401 every attempt; set the secret or drop REQUIRE_TOKEN"
+  exit 2
+fi
+
+# The read APIs live on the API host (LOADTEST_TARGET itself — Go's apiHost),
+# NOT on the derived lobby host; the scheme follows the same rule the lobby
+# derivation uses (http for an IP[:port] target, https otherwise).
+READ_HOST="$TARGET"
+case "$TARGET" in
+  *:[0-9]*) READ_SCHEME=http ;;
+  *) if is_ip "${TARGET%%:*}"; then READ_SCHEME=http; else READ_SCHEME=https; fi ;;
+esac
+
+acquire_token() { # bounded, retrying; sets PLAYER_TOKEN + TOKEN_SRC, rc 1 on failure
+  local attempt raw code body tok src
+  for attempt in 1 2 3; do
+    raw=""
+    if [ -n "$BROKER_SECRET" ]; then
+      raw="$(curl -sS --connect-timeout 10 --max-time 30 \
+        -H "Authorization: Bearer $BROKER_SECRET" \
+        -w $'\n%{http_code}' "$TOKEN_URL" 2>/dev/null || true)"
+    else
+      raw="$(curl -sS --connect-timeout 10 --max-time 30 \
+        -w $'\n%{http_code}' "$TOKEN_URL" 2>/dev/null || true)"
+    fi
+    code="${raw##*$'\n'}"                       # the -w line: the HTTP status
+    body=""
+    case "$raw" in *$'\n'*) body="${raw%$'\n'*}" ;; esac
+    case "$code" in
+      2??)
+        # sed, NOT jq — the runner must not grow a dependency for this.  The
+        # broker answers {"token":"…","source":"mint"|"store"}; an unparseable
+        # or sourceless response is a failure, never an invented token.
+        tok="$(printf '%s' "$body" | sed -n 's/.*"token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
+        src="$(printf '%s' "$body" | sed -n 's/.*"source"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
+        case "$src" in
+          mint|store)
+            if [ -n "$tok" ]; then PLAYER_TOKEN="$tok"; TOKEN_SRC="$src"; return 0; fi
+            ;;
+        esac
+        ;;
+    esac
+    [ "$attempt" -lt 3 ] && sleep "$attempt"
+  done
+  return 1
+}
+
+if [ -n "$TOKEN_URL" ]; then
+  if acquire_token; then
+    # The operator's day in UTC+7 — the Go app's betsWindow: start = today's
+    # 17:00:00.000Z, end = tomorrow's 16:59:59.999Z, computed with GNU date.
+    # The explicit "UTC" anchors keep the arithmetic free of the runner's TZ.
+    read_day="$(date -u -d '+7 hours' '+%Y-%m-%d' 2>/dev/null || true)"
+    read_start=""
+    read_end=""
+    case "$read_day" in
+      [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9])
+        read_start="$(date -u -d "$read_day 00:00:00 UTC -7 hours" '+%Y-%m-%dT%H:%M:%S' 2>/dev/null || true)"
+        read_end="$(date -u -d "$read_day 00:00:00 UTC +17 hours -1 second" '+%Y-%m-%dT%H:%M:%S' 2>/dev/null || true)"
+        ;;
+    esac
+    if [ -n "$read_start" ] && [ -n "$read_end" ]; then
+      READ_START="$(printf '%s.000Z' "$read_start" | sed 's/:/%3A/g')"
+      READ_END="$(printf '%s.999Z' "$read_end" | sed 's/:/%3A/g')"
+    elif [ "$REQUIRE_TOKEN" = 1 ]; then
+      # LOADTEST_REQUIRE_TOKEN=1 => exit 2 BEFORE any request on ANY
+      # acquisition-side failure (review W7): a token whose operator-day
+      # window cannot be computed is as unusable as a failed acquisition, so
+      # it gets the same fatal verdict — never a silent degrade that leaves
+      # REQUIRE_TOKEN=1 running a tokenless lobby-only run green.
+      err "could not compute the UTC+7 read window and LOADTEST_REQUIRE_TOKEN=1"
+      exit 2
+    else
+      # a token without its window cannot drive history/details correctly:
+      # fail safe back to today's lobby-only behavior, never a malformed read
+      err "could not compute the UTC+7 read window - degrading to lobby-only (token=none)"
+      PLAYER_TOKEN=""
+      TOKEN_SRC="none"
+    fi
+  elif [ "$REQUIRE_TOKEN" = 1 ]; then
+    err "token acquisition from LOADTEST_TOKEN_URL failed and LOADTEST_REQUIRE_TOKEN=1"
+    exit 2
+  else
+    err "token acquisition from LOADTEST_TOKEN_URL failed - degrading to lobby-only (token=none)"
+  fi
+fi
+
 # ---- pace --------------------------------------------------------------------
 # Each of the LANES lanes paces its share of the budget: one request every
 # LANES/RPS seconds, sleep-based, until the deadline.
@@ -181,17 +330,33 @@ now() { # fractional epoch (integer fallback where %N is unsupported)
 }
 
 lane() {
-  local out last code t now_s rem d
+  local out last code t now_s rem d url rn=0
   while :; do
     now_s="$(now)"
     awk -v a="$now_s" -v b="$DEADLINE" 'BEGIN{exit !(a < b)}' || break
+    url="$URL"
+    if [ -n "$PLAYER_TOKEN" ]; then
+      # Read mix: each request takes the NEXT endpoint round-robin — balance,
+      # history, details, config, then the tokenless lobby catalog, cycling.
+      # The raw token lives only in these request URLs, never in script output.
+      # Read-only by construction: spin (/…/spin) and the mint
+      # (/client/player/fun-mode-token) are never in this rotation.
+      rn=$((rn + 1))
+      case "$rn" in
+        1) url="$READ_SCHEME://$READ_HOST/api/v2/balance?oc=$OCS&t=$PLAYER_TOKEN" ;;
+        2) url="$READ_SCHEME://$READ_HOST/api/bets?brandCode=$OCS&gameCode=$GAME_CODE&playerToken=$PLAYER_TOKEN&startDate=$READ_START&endDate=$READ_END&skip=0&limit=20" ;;
+        3) url="$READ_SCHEME://$READ_HOST/api/total-bets?brandCode=$OCS&gameCode=$GAME_CODE&playerToken=$PLAYER_TOKEN&startDate=$READ_START&endDate=$READ_END" ;;
+        4) url="$READ_SCHEME://$READ_HOST/$GAME_CODE/config?brandCode=$OCS&gameCode=$GAME_CODE&playerToken=$PLAYER_TOKEN" ;;
+        *) url="$URL"; rn=0 ;;
+      esac
+    fi
     out="$(curl -sS -m 15 \
       -A 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36' \
       -H 'Accept: application/json, text/plain, */*' \
       -H 'Accept-Language: en-US,en;q=0.9' \
       -H "Referer: $SCHEME://$HOST/" \
       -w '\n%{http_code} %{time_total}' \
-      "$URL" 2>/dev/null)"
+      "$url" 2>/dev/null)"
     last="$(printf '%s\n' "$out" | tail -n1)"
     code="${last%% *}"
     t="${last##* }"
@@ -295,8 +460,10 @@ errpct="$(awk -v f="$fail" -v s="$sent" 'BEGIN{printf "%.1f", (s > 0) ? 100 * f 
 # Throughput floor: LOADTEST_RPS * percent / 100, one decimal — "off" when
 # MINRPS is 0 (the disabled default), so the summary always reports the gate.
 floor="$(awk -v r="$RPS" -v p="$MINRPS" 'BEGIN{if (p + 0 > 0) printf "%.1f", r * p / 100; else printf "off"}')"
-printf 'summary: sent=%s ok=%s fail=%s duration=%s rps=%s err%%=%s p50=%s p95=%s max=%s game_err%%=%s minrps=%s\n' \
-  "$sent" "$ok" "$fail" "$DUR" "$rps" "$errpct" "$p50" "$p95" "$pmax" "$g_err_field" "$floor"
+# token= names the SOURCE only (mint|store|none) — the raw token must never
+# appear in the summary or any line this script emits.
+printf 'summary: sent=%s ok=%s fail=%s duration=%s rps=%s err%%=%s p50=%s p95=%s max=%s game_err%%=%s minrps=%s token=%s\n' \
+  "$sent" "$ok" "$fail" "$DUR" "$rps" "$errpct" "$p50" "$p95" "$pmax" "$g_err_field" "$floor" "$TOKEN_SRC"
 
 # STRICTLY exceeds the threshold => failure (100% errors with a threshold of
 # 100 does NOT exceed it).
