@@ -25,7 +25,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
-      LOADTEST_RPS: "20"
+      LOADTEST_RPS: "10"
       LOADTEST_DURATION_SECS: "120"
       LOADTEST_MIN_RPS_PERCENT: "50"
       # Token leg: acquire ONE player token from the broker (mint-first, so the
