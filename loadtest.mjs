@@ -21,6 +21,22 @@
 // The bash version ran the read mix even on source=mint — it could never
 // spin, which is exactly the defect this file exists to remove.
 //
+// DRAINED WALLET (a deliberate DIVERGENCE from Go — Go parks a drained
+// worker BY DESIGN and recovers only via IP rotation replacing the machine
+// (controller.go:1502 os.Exit → fresh Fly machine); takeFromStore exists
+// but is not drain-triggered and never reaches a parked worker, so it is
+// NOT the recovery model here): a source=mint spin reporting an exhausted
+// wallet arms ONE run-scoped re-acquisition — the
+// shared postgres store behind the broker serves every platform, and the
+// operator's architecture says a platform that needs a token READS one
+// from that store when it's needed. mint => the run resumes spins (every lane
+// re-authorizes once: the session was bound to the old token); store => the
+// three-level rule holds and the remainder reads; failure => a warning and
+// honest reads, NEVER a different exit code. One attempt per run, shared by
+// every lane: the broker enforces a 5s mint spacing gate, so N lanes
+// draining together must not stampede it. A source=store run never
+// re-acquires — it is ALREADY the read-only fallback.
+//
 // Orthogonal to (and layered ON TOP of) that rule: GAME_WALL_CONSECUTIVE
 // game-path responses carrying the WAF "Error Code: 3000" signature degrade
 // the WHOLE run to lobby-only for the remainder — GitHub's egress is walled
@@ -30,7 +46,8 @@
 // wall=game-path.
 //
 // The runner NEVER mints (/client/player/fun-mode-token) and never holds a
-// fleet token: supply is one broker acquisition before the run.
+// fleet token: supply is broker acquisitions only — one before the run plus
+// at most ONE mid-run re-acquisition when a source=mint wallet drains.
 //
 // Env contract (docs/spec-20261011-gha-cron-loadtest.md — preserved from the
 // bash script unless noted):
@@ -71,8 +88,10 @@
 //   LOADTEST_TOKEN_URL          unset/empty = lobby-only behavior exactly (no
 //                               acquisition; summary token=none); SET = ONE
 //                               player token is acquired from the broker
-//                               BEFORE the run and the mode follows its
-//                               source: mint => full mix, store => read GETs
+//                               BEFORE the run (plus at most ONE mid-run
+//                               re-acquisition when a source=mint wallet
+//                               drains) and the mode follows its source:
+//                               mint => full mix, store => read GETs
 //   LOADTEST_BROKER_SECRET      sent as `Authorization: Bearer <secret>` on
 //                               the acquisition call
 //   LOADTEST_REQUIRE_TOKEN      default 0: acquisition failure DEGRADES to
@@ -436,9 +455,10 @@ export const GAME_WALL_CONSECUTIVE = 3;
 // direction — it never bans a game), never a degradation trigger.
 export const WALL_MARKERS = ['Error Code: 3000'];
 
-// isWallBody: the two WAF signatures — the HTML wall page and the JSON
-// gateway variant ("code":3000) Go's stats tests pin.
-export function isWallBody(text) {
+// isWallBody: ONLY the discriminating "Error Code: 3000" text matches — a body carrying just
+// the JSON ("code":3000) variant does NOT (deliberate: worker/catalog.test.js pins that shape
+// a NON-wall, and the live wall bodies carry the phrase — e.out, bug-20261011 fleet mints).
+function isWallBody(text) {
   return typeof text === 'string' && WALL_MARKERS.some((m) => text.includes(m));
 }
 
@@ -513,6 +533,7 @@ async function doSpin(ctx, state) {
   // skipping (Go callSpin fires config when the stake is missing).
   if (state.betSize <= 0) await doConfig(ctx, state);
   if (state.betSize <= 0) return { substituted: true };
+  const spunToken = ctx.token; // the token this verdict will be ABOUT
   const res = await ctx.send(spinUrl(ctx), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -522,7 +543,7 @@ async function doSpin(ctx, state) {
     body: JSON.stringify({
       gameCode: ctx.cfg.gameCode,
       brandCode: ctx.cfg.ocs,
-      playerToken: ctx.token,
+      playerToken: spunToken,
       betSize: state.betSize,
       betLevel: state.betLevel,
       walletType: 'CASH',
@@ -530,7 +551,11 @@ async function doSpin(ctx, state) {
   });
   if (res.status === 200 || res.status === 201) return { spun: true };
   if (isSpentTokenBody(res.text)) {
-    state.noBalance = true; // keep the token for reads, degrade the spin slots
+    // Only a verdict about the CURRENT token arms the degrade: a sibling
+    // lane's mid-run refill may have swapped ctx.token while this spin was
+    // in flight, and that stale answer must not re-degrade a healthy lane
+    // (Go callReadOnly: keep the token for reads, degrade the spin slots).
+    if (spunToken === ctx.token) state.noBalance = true;
     return { spun: true, degraded: true };
   }
   if (isSessionInvalidBody(res.text)) await doAuthorize(ctx, state); // dead session, fine token
@@ -598,17 +623,30 @@ async function doFullAction(ctx, state, action) {
 // seconds) until the deadline — the bash loop's shape, await-based.
 async function runLane(ctx, idx, deadline) {
   // Per-lane session: authorized/noBalance/stake, exactly Go's Session fields
-  // the mix reacts to.
-  const state = { authorized: false, noBalance: false, betSize: -1, betLevel: 1 };
+  // the mix reacts to. epoch mirrors ctx.epoch (the token generation this
+  // lane last synced against); registered so a refill can clear the drain.
+  const state = { authorized: false, noBalance: false, betSize: -1, betLevel: 1, epoch: 0 };
+  ctx.laneStates.push(state);
+  // syncToken: a mid-run refill swaps ctx.token, and the gateway session is
+  // bound to the token it was authorized with — so each lane re-authorizes
+  // exactly once per token epoch, before its next full-mix slot.
+  const syncToken = async () => {
+    if (state.epoch === ctx.epoch) return;
+    state.epoch = ctx.epoch;
+    state.authorized = false;
+    state.betSize = -1; // the stake config is re-derived under the new token
+    await doAuthorize(ctx, state);
+  };
   const rng = mulberry32((MIX_SEED_BASE + idx * LANE_PHASE) >>> 0);
   let rr = idx; // read-mode rotation offset, seeded by the lane index (de-phased lanes)
   const intervalMs = (ctx.cfg.lanes / ctx.cfg.rps) * 1000;
 
   if (ctx.mode === 'full' && !ctx.wall.degraded) {
-    // Bootstrap like Go's worker: authorize once per lane, then load the
-    // stake config; both are real requests and both are recorded. Skipped
-    // when a sibling lane already proved the wall — a doomed bootstrap
-    // cannot help anyone.
+    // Bootstrap like Go's worker: authorize once per lane, then load the stake config; both are
+    // real requests and both are recorded. The !degraded term is DEFENSIVE — unreachable today:
+    // Promise.all creates every lane in one tick and each lane's first await is this
+    // doAuthorize, so no response has landed when the guard is evaluated. It protects the
+    // invariant only if wall detection ever moves ahead of lane launch (e.g. a boot-time probe).
     await doAuthorize(ctx, state);
     await doConfig(ctx, state);
   }
@@ -624,20 +662,34 @@ async function runLane(ctx, idx, deadline) {
       // hidden.
       await doLobby(ctx);
     } else if (ctx.mode === 'full') {
-      const action = pickAction(rng);
-      if (action === 'spin') {
-        if (state.noBalance) {
-          // The wallet-level form of the three-level rule: this lane's spin
-          // slots become reads for the rest of the run (Go callReadOnly) —
-          // the slot still issues a real request, so the RPS budget and the
-          // success counters stay honest.
-          await doRead(ctx, state, rng);
+      // A sibling lane may have refilled a drained wallet mid-run: re-sync
+      // this lane's session to the current token epoch first.
+      await syncToken(state);
+      let action = pickAction(rng);
+      if (action === 'spin' && state.noBalance) {
+        // The wallet-level three-level rule, with the operator's refill door
+        // (the shared-DB architecture — deliberately NOT Go's takeFromStore,
+        // which is not drain-triggered and never reaches a parked worker):
+        // ONE run-scoped re-acquire — never one per
+        // lane, the broker enforces a 5s mint spacing gate. A mint refill
+        // that clears the drain resumes the spin mix; any other outcome
+        // (broker dry/down, or the refill itself drained) keeps this lane
+        // on honest reads for the rest of the run — the slot still issues a
+        // real request, so the RPS budget and counters stay truthful.
+        if ((await ctx.reacquire()) && !state.noBalance) {
+          await syncToken(state); // the refill bumped the epoch
+          action = pickAction(rng);
         } else {
-          const r = await doSpin(ctx, state);
-          if (r.substituted) await doRead(ctx, state, rng);
+          action = null; // degraded to reads: substitute the slot below
         }
-      } else {
+      }
+      if (action === 'spin') {
+        const r = await doSpin(ctx, state);
+        if (r.substituted) await doRead(ctx, state, rng);
+      } else if (action !== null) {
         await doFullAction(ctx, state, action);
+      } else {
+        await doRead(ctx, state, rng);
       }
     } else if (ctx.mode === 'read') {
       // The bash round-robin, ported exactly: balance, history, details,
@@ -755,12 +807,85 @@ export async function runLoadtest({ env = {}, fetchFn, out, errOut, acquireDelay
     return res;
   };
 
+  // ── mid-run refill (ONE re-acquire per run, shared by every lane) ────────
+  // The shared postgres store behind the broker serves every platform, so a
+  // fresh token IS available mid-run — the operator's architecture: a
+  // platform that needs a token READS one from the store when it's needed.
+  // Deliberate divergence from Go, which parks a drained worker BY DESIGN
+  // and recovers only via IP rotation (games.go:758-763, :1293, :2453-2456;
+  // controller.go:1502) — Go's takeFromStore is not drain-triggered and
+  // never reaches a parked worker. The latch is per-run and run-scoped like
+  // `wall`: the synchronous attempted-flag flip happens before the first await, so
+  // concurrent lanes draining together fire exactly ONE bounded
+  // re-acquisition (the broker enforces a 5s mint spacing gate) and every
+  // other lane awaits the same promise. One attempt per run by design — a
+  // failed refill degrades to honest reads (a warning, never a different
+  // exit code), and a second mint wallet draining again degrades the same
+  // way. Only source=mint runs ever get here: full mode is unreachable for
+  // store (read) and missing (lobby) tokens, and a store-refill result
+  // holds the three-level rule (store => read) for the remainder.
+  // ── the drain marker (the summary's drain= field) ─────────────────────────
+  // wall='s counterpart for the wallet: wall= names WHY the game share
+  // dropped, drain= names WHAT the wallet did — a run that stopped betting
+  // must never hide behind mix=full token=mint (the wall= precedent; the
+  // token=/mix= rules are untouched). Values: none (never drained) |
+  // refill-ok (re-acquire minted; resumed) | refill-store (store fallback;
+  // reads) | refill-failed (attempted, failed; reads) | no-refill (no
+  // acquisition left — door closed or latch spent, a SECOND drain; reads).
+  const drain = { state: 'none' };
+  const refill = { attempted: false };
+  let refillPromise = null;
+  const doRefill = async () => {
+    if (cfg.tokenUrl === '') {
+      drain.state = 'no-refill'; // no acquisition door: lobby-only by contract
+      return false;
+    }
+    const got = await acquireToken(cfg, fetchFn ?? globalThis.fetch, acquireDelayMs);
+    if (!got) {
+      drain.state = 'refill-failed';
+      fail('the wallet drained and the re-acquisition from LOADTEST_TOKEN_URL failed - reading for the rest of the run');
+      return false;
+    }
+    ctx.token = got.token; // the raw token lives only on the wire and in memory — never in an emitted line
+    if (got.source === 'mint') {
+      drain.state = 'refill-ok';
+      ctx.epoch += 1; // every lane re-authorizes once (syncToken) before its next spin
+      // Fresh wallet: the old drain verdict was about the old token.
+      for (const s of ctx.laneStates) s.noBalance = false;
+      emit('token source=mint re-acquired after the wallet drained - resuming spins');
+      return true;
+    }
+    // source=store: the mint-empty fallback IS read-only by design — the
+    // three-level rule holds (store => read) for the rest of the run.
+    drain.state = 'refill-store';
+    tokenSrc = got.source;
+    mode = 'read';
+    ctx.mode = 'read';
+    emit('token source=store re-acquired after the wallet drained - reading for the rest of the run');
+    return false;
+  };
+  const reacquire = () => {
+    if (!refill.attempted) {
+      refill.attempted = true; // flipped synchronously: a racing lane cannot double-fire
+      refillPromise = doRefill();
+    } else if (drain.state === 'refill-ok') {
+      // The attempt has settled as mint, so this is a NEW drain on the
+      // refilled wallet — a SECOND drain: no third acquisition, and the
+      // marker must say so (settling already cleared every lane's verdict).
+      drain.state = 'no-refill';
+    }
+    return refillPromise;
+  };
+
   const ctx = {
     cfg,
     token,
     mode,
     wall,
     send,
+    epoch: 0, // token generation: bumped by a successful refill, synced per lane
+    laneStates: [], // every lane's session state, so a refill can clear the drain
+    reacquire,
     api: `${cfg.readScheme}://${cfg.readHost}`,
     window: () => window,
     // The operator day may roll past UTC+7 midnight mid-run; recompute once
@@ -817,8 +942,11 @@ export async function runLoadtest({ env = {}, fetchFn, out, errOut, acquireDelay
   // ── summary ─────────────────────────────────────────────────────────────
   // p50/p95 by nearest rank over the sorted per-request times; max is the
   // last. Fields APPEND, never reorder: the trailing minrps=/token=/mix=
-  // (full|read|lobby — the mode, never the token) and the wall= verdict
-  // (none|game-path — WHY the game share dropped, when it did).
+  // (full|read|lobby — the mode, never the token), the wall= verdict
+  // (none|game-path — WHY the game share dropped, when it did) and the
+  // drain= verdict (none|refill-ok|refill-store|refill-failed|no-refill —
+  // WHAT the wallet did when it drained, so mix=full never silently sits
+  // over a run that stopped betting).
   const sent = records.length;
   const okCount = records.filter((r) => r.status >= 200 && r.status < 300).length;
   const failCount = sent - okCount;
@@ -834,7 +962,7 @@ export async function runLoadtest({ env = {}, fetchFn, out, errOut, acquireDelay
     `summary: sent=${sent} ok=${okCount} fail=${failCount} duration=${cfg.dur} rps=${rpsPrinted} err%=${errPct.toFixed(1)} ` +
       `p50=${rank(0.5).toFixed(3)} p95=${rank(0.95).toFixed(3)} max=${sent === 0 ? '0.0' : times[times.length - 1].toFixed(3)} ` +
       `game_err%=${gErrField} minrps=${floor === null ? 'off' : floor.toFixed(1)} token=${tokenSrc} mix=${mode} ` +
-      `wall=${wall.degraded ? 'game-path' : 'none'}`,
+      `wall=${wall.degraded ? 'game-path' : 'none'} drain=${drain.state}`,
   );
 
   // ── gates (STRICTLY exceeds, bash parity: 100% errors with a threshold of
