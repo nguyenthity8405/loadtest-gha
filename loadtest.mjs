@@ -764,13 +764,15 @@ export async function runLoadtest({ env = {}, fetchFn, out, errOut, acquireDelay
 
   // ── recording (one TSV line per real request) ───────────────────────────
   const records = [];
-  const record = (status, secs) => {
-    records.push({ status, secs });
+  const fails = { wall: 0, generic: 0, other: 0 }; // failure-body classes for the summary's fails=wall/generic/other
+  const record = (res) => {
+    records.push({ status: res.status, secs: res.secs });
+    if (res.status < 200 || res.status >= 300) fails[isWallResponse(res) ? 'wall' : res.text.includes('Error processing your request') ? 'generic' : 'other'] += 1;
     try {
       // 3-digit status, exactly the bash TSV: curl -w %{http_code} recorded
       // 000 for a refused/timed-out request, and every consumer of
       // loadtest-results.tsv parses <status> as 3 digits.
-      appendFileSync(cfg.log, `${String(status).padStart(3, '0')}\t${secs.toFixed(6)}\n`);
+      appendFileSync(cfg.log, `${String(res.status).padStart(3, '0')}\t${res.secs.toFixed(6)}\n`);
     } catch {
       // a failed append must not kill the run — the summary still counts it
     }
@@ -800,7 +802,7 @@ export async function runLoadtest({ env = {}, fetchFn, out, errOut, acquireDelay
   };
   const send = async (url, opts = {}) => {
     const res = await httpRequest(fetchFn, url, { ...opts, headers: browserHeaders(referer, opts.headers ?? {}) });
-    record(res.status, res.secs);
+    record(res);
     // Detection runs AFTER the record: every pre-detection request stays
     // counted truthfully — the wall stops FUTURE doomed requests, it never
     // hides past ones.
@@ -917,10 +919,8 @@ export async function runLoadtest({ env = {}, fetchFn, out, errOut, acquireDelay
   // unless a threshold is set (the wall must be VISIBLE, not flapping the
   // workflow red). Probe requests do NOT enter the TSV/summary accounting
   // (bash parity).
-  let gSent = 0;
-  let gFail = 0;
-  const gStatuses = [];
-  const gBodies = [];
+  let gSent = 0, gFail = 0;
+  const gStatuses = [], gBodies = [];
   if (cfg.gprobeCode === '') {
     log('gameprobe: skipped');
   } else {
@@ -947,8 +947,8 @@ export async function runLoadtest({ env = {}, fetchFn, out, errOut, acquireDelay
   // (none|game-path — WHY the game share dropped, when it did) and the
   // drain= verdict (none|refill-ok|refill-store|refill-failed|no-refill —
   // WHAT the wallet did when it drained, so mix=full never silently sits
-  // over a run that stopped betting).
-  const sent = records.length;
+  // over a run that stopped betting). Then the two CLASSIFICATION fields: status=<code>:<count> is the run's recorded-status histogram (000-padded, ascending — the TSV's own shape), and fails=wall:W,generic:G,other:O splits the failures by BODY — W is what the wall mechanism itself would claim (isWallResponse: "Error Code: 3000" on 400/403), G the generic "Error processing your request" envelope that also wraps ordinary wallet/session/provider verdicts, O everything else (a 000 has no body) — so an err% like the live 35.3% is classifiable from ONE line, never from truncated logs.
+  const sent = records.length, statusHist = records.reduce((m, r) => ((m[r.status] = (m[r.status] ?? 0) + 1), m), {});
   const okCount = records.filter((r) => r.status >= 200 && r.status < 300).length;
   const failCount = sent - okCount;
   const times = records.map((r) => r.secs).sort((a, b) => a - b);
@@ -963,7 +963,7 @@ export async function runLoadtest({ env = {}, fetchFn, out, errOut, acquireDelay
     `summary: sent=${sent} ok=${okCount} fail=${failCount} duration=${cfg.dur} rps=${rpsPrinted} err%=${errPct.toFixed(1)} ` +
       `p50=${rank(0.5).toFixed(3)} p95=${rank(0.95).toFixed(3)} max=${sent === 0 ? '0.0' : times[times.length - 1].toFixed(3)} ` +
       `game_err%=${gErrField} minrps=${floor === null ? 'off' : floor.toFixed(1)} token=${tokenSrc} mix=${mode} ` +
-      `wall=${wall.degraded ? 'game-path' : 'none'} drain=${drain.state}`,
+      `wall=${wall.degraded ? 'game-path' : 'none'} drain=${drain.state} status=${Object.entries(statusHist).map(([s, n]) => `${String(s).padStart(3, '0')}:${n}`).join(',')} fails=wall:${fails.wall},generic:${fails.generic},other:${fails.other}`,
   );
 
   // ── gates (STRICTLY exceeds, bash parity: 100% errors with a threshold of
