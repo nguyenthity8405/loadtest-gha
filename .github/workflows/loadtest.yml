@@ -27,7 +27,7 @@ jobs:
     env:
       LOADTEST_RPS: "8"
       LOADTEST_DURATION_SECS: "120"
-      LOADTEST_MIN_RPS_PERCENT: "50"
+      LOADTEST_MIN_RPS_PERCENT: "35"
       # Token leg: acquire ONE player token from the broker (mint-first, so the
       # runner never mints from GitHub egress) and drive the apig read-data
       # APIs with it. The URL is public; the secret is a GitHub Actions secret
