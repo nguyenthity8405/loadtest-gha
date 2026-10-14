@@ -472,6 +472,8 @@ export function isWallResponse(res) {
 }
 
 // ── URLs (verbatim shapes from the Go call sites — PROVEN on the gateway) ──
+// gamePathBase is THE game-path shape: configUrl/spinUrl build on it, and the wall streak judges only URLs under it (isGamePathUrl).
+const gamePathBase = (api, code) => `${api}/${code}/`;
 const balanceUrl = (ctx) => `${ctx.api}/api/v2/balance?oc=${ctx.cfg.ocs}&t=${ctx.token}`;
 const historyUrl = (ctx) => {
   const w = ctx.window();
@@ -482,8 +484,8 @@ const detailsUrl = (ctx) => {
   return `${ctx.api}/api/total-bets?brandCode=${ctx.cfg.ocs}&gameCode=${ctx.cfg.gameCode}&playerToken=${ctx.token}&startDate=${w.start}&endDate=${w.end}`;
 };
 const configUrl = (ctx) =>
-  `${ctx.api}/${ctx.cfg.gameCode}/config?brandCode=${ctx.cfg.ocs}&gameCode=${ctx.cfg.gameCode}&playerToken=${ctx.token}`;
-const spinUrl = (ctx) => `${ctx.api}/${ctx.cfg.gameCode}/spin`;
+  `${gamePathBase(ctx.api, ctx.cfg.gameCode)}config?brandCode=${ctx.cfg.ocs}&gameCode=${ctx.cfg.gameCode}&playerToken=${ctx.token}`;
+const spinUrl = (ctx) => `${gamePathBase(ctx.api, ctx.cfg.gameCode)}spin`;
 const authUrl = (ctx) => `${ctx.api}/client/player/authorize-game`;
 
 // ── actions ───────────────────────────────────────────────────────────────
@@ -777,16 +779,15 @@ export async function runLoadtest({ env = {}, fetchFn, out, errOut, acquireDelay
   // ── game-path wall detection ─────────────────────────────────────────────
   // Run-level state, like Go's error-rate rotation guard: the wall is a fact
   // about THIS EGRESS, not about one lane, so the lanes that prove it degrade
-  // every lane. The counter is shared across lanes; a healthy game-path
-  // answer resets it, lobby answers never touch it (they are the reachable
-  // surface, not evidence). Best-effort under concurrency by design: the live
-  // wall refuses 100% of game-path requests, so interleaving never hides it.
+  // every lane. The counter is shared across lanes and judges the GAME PATH
+  // ONLY (isGamePathUrl) — a healthy game-path answer resets it, auth/balance/
+  // history/details/lobby answers are not evidence and never touch it (before,
+  // ANY non-wall answer wiped the streak, so 3 CONSECUTIVE walls never piled
+  // up — a live run burned ~40% of its budget on the walled path, wall=none).
   const wall = { consecutive: 0, degraded: false };
-  // The lobby-catalog path (on its derived host, and on the apig host as the
-  // doLobby transport fallback) is the reachable surface — never judged.
-  const isLobbyUrl = (url) => url === cfg.lobbyUrl || url === cfg.lobbyFallbackUrl;
+  const isGamePathUrl = (url) => url.startsWith(gamePathBase(`${cfg.readScheme}://${cfg.readHost}`, cfg.gameCode));
   const noteWall = (url, res) => {
-    if (wall.degraded || isLobbyUrl(url)) return;
+    if (wall.degraded || !isGamePathUrl(url)) return;
     if (isWallResponse(res)) {
       wall.consecutive += 1;
       if (wall.consecutive >= GAME_WALL_CONSECUTIVE) {
