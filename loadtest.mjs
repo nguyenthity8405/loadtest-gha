@@ -43,7 +43,7 @@
 // on the game path while the lobby host stays reachable
 // (docs/bug-20261012-gha-keeps-firing-a-walled-game-path.md). mix= still
 // names the source-selected mode; the summary reports the degradation as
-// wall=game-path.
+// wall=game-path. The ORTHOGONAL spin-side refusal guard (SPIN_REFUSAL_CONSECUTIVE) is the per-game sibling: N consecutive provider-403 bet verdicts degrade that game's spin slots to reads, reported as refusal=<game>.
 //
 // The runner NEVER mints (/client/player/fun-mode-token) and never holds a
 // fleet token: supply is broker acquisitions only — one before the run plus
@@ -471,18 +471,21 @@ export function isWallResponse(res) {
   return !!res && (res.status === 400 || res.status === 403) && isWallBody(res.text);
 }
 
+// SPIN_REFUSAL_CONSECUTIVE: N CONSECUTIVE bet-endpoint 403s WITHOUT the wall
+// marker are the game's provider verdict (docs/bugs/provider-403-game-never-
+// banned.md — the reads prove the session/egress healthy), so that game's
+// spin slots become reads for the rest of the run (Go's bad-games; one-way
+// here, like the wall). Strictly independent of the wall: a 403 wearing
+// "Error Code: 3000" belongs to the wall streak only, and a wallet/session
+// verdict at any status judges nothing (banGameOnFailure's exclusion).
+export const SPIN_REFUSAL_CONSECUTIVE = 3;
+
 // ── URLs (verbatim shapes from the Go call sites — PROVEN on the gateway) ──
 // gamePathBase is THE game-path shape: configUrl/spinUrl build on it, and the wall streak judges only URLs under it (isGamePathUrl).
 const gamePathBase = (api, code) => `${api}/${code}/`;
 const balanceUrl = (ctx) => `${ctx.api}/api/v2/balance?oc=${ctx.cfg.ocs}&t=${ctx.token}`;
-const historyUrl = (ctx) => {
-  const w = ctx.window();
-  return `${ctx.api}/api/bets?brandCode=${ctx.cfg.ocs}&gameCode=${ctx.cfg.gameCode}&playerToken=${ctx.token}&startDate=${w.start}&endDate=${w.end}&skip=0&limit=20`;
-};
-const detailsUrl = (ctx) => {
-  const w = ctx.window();
-  return `${ctx.api}/api/total-bets?brandCode=${ctx.cfg.ocs}&gameCode=${ctx.cfg.gameCode}&playerToken=${ctx.token}&startDate=${w.start}&endDate=${w.end}`;
-};
+const historyUrl = (ctx) => { const w = ctx.window(); return `${ctx.api}/api/bets?brandCode=${ctx.cfg.ocs}&gameCode=${ctx.cfg.gameCode}&playerToken=${ctx.token}&startDate=${w.start}&endDate=${w.end}&skip=0&limit=20`; };
+const detailsUrl = (ctx) => { const w = ctx.window(); return `${ctx.api}/api/total-bets?brandCode=${ctx.cfg.ocs}&gameCode=${ctx.cfg.gameCode}&playerToken=${ctx.token}&startDate=${w.start}&endDate=${w.end}`; };
 const configUrl = (ctx) =>
   `${gamePathBase(ctx.api, ctx.cfg.gameCode)}config?brandCode=${ctx.cfg.ocs}&gameCode=${ctx.cfg.gameCode}&playerToken=${ctx.token}`;
 const spinUrl = (ctx) => `${gamePathBase(ctx.api, ctx.cfg.gameCode)}spin`;
@@ -501,21 +504,11 @@ async function doAuthorize(ctx, state) {
   return res;
 }
 
-async function doConfig(ctx, state) {
-  const res = await ctx.send(configUrl(ctx), { action: 'config' });
-  if (res.status === 200) applyStake(state, res.text);
-  return res;
-}
+async function doConfig(ctx, state) { const res = await ctx.send(configUrl(ctx), { action: 'config' }); if (res.status === 200) applyStake(state, res.text); return res; }
 
-async function doBalance(ctx) {
-  return ctx.send(balanceUrl(ctx), { action: 'balance' });
-}
-async function doHistory(ctx) {
-  return ctx.send(historyUrl(ctx), { action: 'history' });
-}
-async function doDetails(ctx) {
-  return ctx.send(detailsUrl(ctx), { action: 'details' });
-}
+async function doBalance(ctx) { return ctx.send(balanceUrl(ctx), { action: 'balance' }); }
+async function doHistory(ctx) { return ctx.send(historyUrl(ctx), { action: 'history' }); }
+async function doDetails(ctx) { return ctx.send(detailsUrl(ctx), { action: 'details' }); }
 
 // doLobby hits the derived lobby host; on a TRANSPORT failure it retries the
 // apig host once — that host serves the identical catalog path (Go's
@@ -571,40 +564,28 @@ const READ_ACTIONS = ['history', 'config', 'balance', 'details', 'lobby'];
 async function doRead(ctx, state, rng, name) {
   const action = name ?? READ_ACTIONS[Math.floor(rng() * READ_ACTIONS.length)];
   switch (action) {
-    case 'history':
-      return doHistory(ctx);
-    case 'details':
-      return doDetails(ctx);
-    case 'balance':
-      return doBalance(ctx);
-    case 'config':
-      return doConfig(ctx, state);
-    case 'lobby':
-    default:
-      return doLobby(ctx);
+    case 'history': return doHistory(ctx);
+    case 'details': return doDetails(ctx);
+    case 'balance': return doBalance(ctx);
+    case 'config': return doConfig(ctx, state);
+    case 'lobby': default: return doLobby(ctx);
   }
 }
 
 // The non-spin full-mix actions.
 async function doFullAction(ctx, state, action) {
   switch (action) {
-    case 'auth':
-      return doAuthorize(ctx, state);
+    case 'auth': return doAuthorize(ctx, state);
     case 'new-token':
       // Go's WNewTok slot is the last-resort token refill; the runner never
       // mints, so the slot refreshes the SESSION — a re-authorize, which is
       // the only session refresh this surface has.
       return doAuthorize(ctx, state);
-    case 'config':
-      return doConfig(ctx, state);
-    case 'balance':
-      return doBalance(ctx);
-    case 'history':
-      return doHistory(ctx);
-    case 'details':
-      return doDetails(ctx);
-    case 'lobby':
-      return doLobby(ctx);
+    case 'config': return doConfig(ctx, state);
+    case 'balance': return doBalance(ctx);
+    case 'history': return doHistory(ctx);
+    case 'details': return doDetails(ctx);
+    case 'lobby': return doLobby(ctx);
     case 'env-config': {
       const url = ctx.cfg.gameHost ? `${ctx.cfg.gameHost}/env-config.js?isFun=true` : '';
       if (!url) return null; // no derivable client host: the action is off (Go parity)
@@ -615,8 +596,7 @@ async function doFullAction(ctx, state, action) {
       if (!url) return null;
       return ctx.send(url, { action: 'client-config' });
     }
-    default:
-      return doLobby(ctx);
+    default: return doLobby(ctx);
   }
 }
 
@@ -685,6 +665,7 @@ async function runLane(ctx, idx, deadline) {
           action = null; // degraded to reads: substitute the slot below
         }
       }
+      if (action === 'spin' && ctx.refusal.degraded) action = null; // the game proved it refuses its bets — this slot becomes an honest read, still a real request (Go callReadOnly's shape)
       if (action === 'spin') {
         const r = await doSpin(ctx, state);
         if (r.substituted) await doRead(ctx, state, rng);
@@ -800,13 +781,30 @@ export async function runLoadtest({ env = {}, fetchFn, out, errOut, acquireDelay
       wall.consecutive = 0;
     }
   };
+
+  // The spin-side refusal guard's run-scoped state and judge (Go's
+  // badGames/banGameOnFailure shape): the streak counts bet-endpoint
+  // provider-403s ONLY — every other spin answer resets it, and non-spin
+  // answers judge nothing at all (the wall's interleaving rule, 5944c9b,
+  // applies here too: interleaved read successes must never wipe it).
+  const refusal = { consecutive: 0, degraded: false, game: '' };
+  const noteRefusal = (action, res) => {
+    if (refusal.degraded || action !== 'spin') return;
+    if (res.status === 403 && !isWallResponse(res) && !isSpentTokenBody(res.text) && !isSessionInvalidBody(res.text)) {
+      if (++refusal.consecutive >= SPIN_REFUSAL_CONSECUTIVE) {
+        refusal.degraded = true;
+        refusal.game = cfg.gameCode;
+        fail(`the game ${cfg.gameCode} refused ${SPIN_REFUSAL_CONSECUTIVE} consecutive spins (provider 403) - its spin slots become reads for the rest of the run`);
+      }
+    } else refusal.consecutive = 0;
+  };
   const send = async (url, opts = {}) => {
     const res = await httpRequest(fetchFn, url, { ...opts, headers: browserHeaders(referer, opts.headers ?? {}) });
     record(res, opts.action);
     // Detection runs AFTER the record: every pre-detection request stays
     // counted truthfully — the wall stops FUTURE doomed requests, it never
     // hides past ones.
-    noteWall(url, res);
+    noteWall(url, res); noteRefusal(opts.action, res);
     return res;
   };
 
@@ -884,7 +882,7 @@ export async function runLoadtest({ env = {}, fetchFn, out, errOut, acquireDelay
     cfg,
     token,
     mode,
-    wall,
+    wall, refusal,
     send,
     epoch: 0, // token generation: bumped by a successful refill, synced per lane
     laneStates: [], // every lane's session state, so a refill can clear the drain
@@ -947,7 +945,7 @@ export async function runLoadtest({ env = {}, fetchFn, out, errOut, acquireDelay
   // (none|game-path — WHY the game share dropped, when it did) and the
   // drain= verdict (none|refill-ok|refill-store|refill-failed|no-refill —
   // WHAT the wallet did when it drained, so mix=full never silently sits
-  // over a run that stopped betting). Then the three CLASSIFICATION fields: status=<code>:<count> is the run's recorded-status histogram (000-padded, ascending — the TSV's own shape), and fails=wall:W,generic:G,other:O splits the failures by BODY — W is what the wall mechanism itself would claim (isWallResponse: "Error Code: 3000" on 400/403), G the generic "Error processing your request" envelope that also wraps ordinary wallet/session/provider verdicts, O everything else (a 000 has no body) — so an err% like the live 35.3% is classifiable from ONE line, never from truncated logs. Then fail403=<action>:<n>[,<action>:<n>]* is the per-action tally of the HTTP 403s THEMSELVES — the live "WHICH action do the 152x403 land on" question (spin => WAF/per-game rejection, the read APIs => session/token expiry, spread => systemic) — only actions that saw at least one 403, alphabetical, "-" when there are none (a transport 000 has no status to tally; it stays in other=).
+  // over a run that stopped betting). Then the three CLASSIFICATION fields: status=<code>:<count> is the run's recorded-status histogram (000-padded, ascending — the TSV's own shape), and fails=wall:W,generic:G,other:O splits the failures by BODY — W is what the wall mechanism itself would claim (isWallResponse: "Error Code: 3000" on 400/403), G the generic "Error processing your request" envelope that also wraps ordinary wallet/session/provider verdicts, O everything else (a 000 has no body) — so an err% like the live 35.3% is classifiable from ONE line, never from truncated logs. Then fail403=<action>:<n>[,<action>:<n>]* is the per-action tally of the HTTP 403s THEMSELVES — the live "WHICH action do the 152x403 land on" question (spin => WAF/per-game rejection, the read APIs => session/token expiry, spread => systemic) — only actions that saw at least one 403, alphabetical, "-" when there are none (a transport 000 has no status to tally; it stays in other=). Finally refusal=<game|none> — the spin-side refusal guard's verdict (wall='s per-game sibling): a game that refused SPIN_REFUSAL_CONSECUTIVE consecutive bet-endpoint 403s — no wall marker, no wallet/session verdict inside — had its spin slots degrade to reads for the rest of the run; appended last, no parsed field moved.
   const sent = records.length, statusHist = records.reduce((m, r) => ((m[r.status] = (m[r.status] ?? 0) + 1), m), {});
   const okCount = records.filter((r) => r.status >= 200 && r.status < 300).length;
   const failCount = sent - okCount;
@@ -963,7 +961,7 @@ export async function runLoadtest({ env = {}, fetchFn, out, errOut, acquireDelay
     `summary: sent=${sent} ok=${okCount} fail=${failCount} duration=${cfg.dur} rps=${rpsPrinted} err%=${errPct.toFixed(1)} ` +
       `p50=${rank(0.5).toFixed(3)} p95=${rank(0.95).toFixed(3)} max=${sent === 0 ? '0.0' : times[times.length - 1].toFixed(3)} ` +
       `game_err%=${gErrField} minrps=${floor === null ? 'off' : floor.toFixed(1)} token=${tokenSrc} mix=${mode} ` +
-      `wall=${wall.degraded ? 'game-path' : 'none'} drain=${drain.state} status=${Object.entries(statusHist).map(([s, n]) => `${String(s).padStart(3, '0')}:${n}`).join(',')} fails=wall:${fails.wall},generic:${fails.generic},other:${fails.other} fail403=${Object.keys(fail403).length === 0 ? '-' : Object.entries(fail403).sort(([a], [b]) => (a < b ? -1 : 1)).map(([a, n]) => `${a}:${n}`).join(',')}`,
+      `wall=${wall.degraded ? 'game-path' : 'none'} drain=${drain.state} status=${Object.entries(statusHist).map(([s, n]) => `${String(s).padStart(3, '0')}:${n}`).join(',')} fails=wall:${fails.wall},generic:${fails.generic},other:${fails.other} fail403=${Object.keys(fail403).length === 0 ? '-' : Object.entries(fail403).sort(([a], [b]) => (a < b ? -1 : 1)).map(([a, n]) => `${a}:${n}`).join(',')} refusal=${refusal.degraded ? refusal.game : 'none'}`,
   );
 
   // ── gates (STRICTLY exceeds, bash parity: 100% errors with a threshold of
