@@ -491,7 +491,7 @@ const authUrl = (ctx) => `${ctx.api}/client/player/authorize-game`;
 // ── actions ───────────────────────────────────────────────────────────────
 async function doAuthorize(ctx, state) {
   const res = await ctx.send(authUrl(ctx), {
-    method: 'POST',
+    action: 'auth', method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     // Plain JSON, exactly the three fields the game client posts (Go
     // fireAuthorize); the gateway rejects a gzipped body with HTTP 400.
@@ -502,19 +502,19 @@ async function doAuthorize(ctx, state) {
 }
 
 async function doConfig(ctx, state) {
-  const res = await ctx.send(configUrl(ctx));
+  const res = await ctx.send(configUrl(ctx), { action: 'config' });
   if (res.status === 200) applyStake(state, res.text);
   return res;
 }
 
 async function doBalance(ctx) {
-  return ctx.send(balanceUrl(ctx));
+  return ctx.send(balanceUrl(ctx), { action: 'balance' });
 }
 async function doHistory(ctx) {
-  return ctx.send(historyUrl(ctx));
+  return ctx.send(historyUrl(ctx), { action: 'history' });
 }
 async function doDetails(ctx) {
-  return ctx.send(detailsUrl(ctx));
+  return ctx.send(detailsUrl(ctx), { action: 'details' });
 }
 
 // doLobby hits the derived lobby host; on a TRANSPORT failure it retries the
@@ -522,8 +522,8 @@ async function doDetails(ctx) {
 // lobbyCatalogURLs last hop), so a DNS/dead-lobby-host blip does not eat the
 // slot. Both attempts are recorded: one TSV line per real request.
 async function doLobby(ctx) {
-  const res = await ctx.send(ctx.cfg.lobbyUrl);
-  if (res.status === 0) return ctx.send(ctx.cfg.lobbyFallbackUrl);
+  const res = await ctx.send(ctx.cfg.lobbyUrl, { action: 'lobby' });
+  if (res.status === 0) return ctx.send(ctx.cfg.lobbyFallbackUrl, { action: 'lobby' });
   return res;
 }
 
@@ -537,7 +537,7 @@ async function doSpin(ctx, state) {
   if (state.betSize <= 0) return { substituted: true };
   const spunToken = ctx.token; // the token this verdict will be ABOUT
   const res = await ctx.send(spinUrl(ctx), {
-    method: 'POST',
+    action: 'spin', method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     // The exact payload the game client posts to the gateway — the six
     // fields internal/loadtest/api_contract_test.go pins; baseBet is NOT
@@ -608,12 +608,12 @@ async function doFullAction(ctx, state, action) {
     case 'env-config': {
       const url = ctx.cfg.gameHost ? `${ctx.cfg.gameHost}/env-config.js?isFun=true` : '';
       if (!url) return null; // no derivable client host: the action is off (Go parity)
-      return ctx.send(url);
+      return ctx.send(url, { action: 'env-config' });
     }
     case 'client-config': {
       const url = ctx.cfg.gameHost ? `${ctx.cfg.gameHost}/config.json?isFun=true` : '';
       if (!url) return null;
-      return ctx.send(url);
+      return ctx.send(url, { action: 'client-config' });
     }
     default:
       return doLobby(ctx);
@@ -764,10 +764,10 @@ export async function runLoadtest({ env = {}, fetchFn, out, errOut, acquireDelay
 
   // ── recording (one TSV line per real request) ───────────────────────────
   const records = [];
-  const fails = { wall: 0, generic: 0, other: 0 }; // failure-body classes for the summary's fails=wall/generic/other
-  const record = (res) => {
+  const fails = { wall: 0, generic: 0, other: 0 }, fail403 = {}; // fails=wall/generic/other = the failure-body classes; fail403 = the per-action 403 tally (WHICH action the provider-403 lands on)
+  const record = (res, action) => {
     records.push({ status: res.status, secs: res.secs });
-    if (res.status < 200 || res.status >= 300) fails[isWallResponse(res) ? 'wall' : res.text.includes('Error processing your request') ? 'generic' : 'other'] += 1;
+    if (res.status < 200 || res.status >= 300) fails[isWallResponse(res) ? 'wall' : res.text.includes('Error processing your request') ? 'generic' : 'other'] += 1; if (res.status === 403) fail403[action ?? 'unknown'] = (fail403[action ?? 'unknown'] ?? 0) + 1;
     try {
       // 3-digit status, exactly the bash TSV: curl -w %{http_code} recorded
       // 000 for a refused/timed-out request, and every consumer of
@@ -802,7 +802,7 @@ export async function runLoadtest({ env = {}, fetchFn, out, errOut, acquireDelay
   };
   const send = async (url, opts = {}) => {
     const res = await httpRequest(fetchFn, url, { ...opts, headers: browserHeaders(referer, opts.headers ?? {}) });
-    record(res);
+    record(res, opts.action);
     // Detection runs AFTER the record: every pre-detection request stays
     // counted truthfully — the wall stops FUTURE doomed requests, it never
     // hides past ones.
@@ -947,7 +947,7 @@ export async function runLoadtest({ env = {}, fetchFn, out, errOut, acquireDelay
   // (none|game-path — WHY the game share dropped, when it did) and the
   // drain= verdict (none|refill-ok|refill-store|refill-failed|no-refill —
   // WHAT the wallet did when it drained, so mix=full never silently sits
-  // over a run that stopped betting). Then the two CLASSIFICATION fields: status=<code>:<count> is the run's recorded-status histogram (000-padded, ascending — the TSV's own shape), and fails=wall:W,generic:G,other:O splits the failures by BODY — W is what the wall mechanism itself would claim (isWallResponse: "Error Code: 3000" on 400/403), G the generic "Error processing your request" envelope that also wraps ordinary wallet/session/provider verdicts, O everything else (a 000 has no body) — so an err% like the live 35.3% is classifiable from ONE line, never from truncated logs.
+  // over a run that stopped betting). Then the two CLASSIFICATION fields: status=<code>:<count> is the run's recorded-status histogram (000-padded, ascending — the TSV's own shape), and fails=wall:W,generic:G,other:O splits the failures by BODY — W is what the wall mechanism itself would claim (isWallResponse: "Error Code: 3000" on 400/403), G the generic "Error processing your request" envelope that also wraps ordinary wallet/session/provider verdicts, O everything else (a 000 has no body) — so an err% like the live 35.3% is classifiable from ONE line, never from truncated logs. Then fail403=<action>:<n>[,<action>:<n>]* is the per-action tally of the HTTP 403s THEMSELVES — the live "WHICH action do the 152x403 land on" question (spin => WAF/per-game rejection, the read APIs => session/token expiry, spread => systemic) — only actions that saw at least one 403, alphabetical, "-" when there are none (a transport 000 has no status to tally; it stays in other=).
   const sent = records.length, statusHist = records.reduce((m, r) => ((m[r.status] = (m[r.status] ?? 0) + 1), m), {});
   const okCount = records.filter((r) => r.status >= 200 && r.status < 300).length;
   const failCount = sent - okCount;
@@ -963,7 +963,7 @@ export async function runLoadtest({ env = {}, fetchFn, out, errOut, acquireDelay
     `summary: sent=${sent} ok=${okCount} fail=${failCount} duration=${cfg.dur} rps=${rpsPrinted} err%=${errPct.toFixed(1)} ` +
       `p50=${rank(0.5).toFixed(3)} p95=${rank(0.95).toFixed(3)} max=${sent === 0 ? '0.0' : times[times.length - 1].toFixed(3)} ` +
       `game_err%=${gErrField} minrps=${floor === null ? 'off' : floor.toFixed(1)} token=${tokenSrc} mix=${mode} ` +
-      `wall=${wall.degraded ? 'game-path' : 'none'} drain=${drain.state} status=${Object.entries(statusHist).map(([s, n]) => `${String(s).padStart(3, '0')}:${n}`).join(',')} fails=wall:${fails.wall},generic:${fails.generic},other:${fails.other}`,
+      `wall=${wall.degraded ? 'game-path' : 'none'} drain=${drain.state} status=${Object.entries(statusHist).map(([s, n]) => `${String(s).padStart(3, '0')}:${n}`).join(',')} fails=wall:${fails.wall},generic:${fails.generic},other:${fails.other} fail403=${Object.keys(fail403).length === 0 ? '-' : Object.entries(fail403).sort(([a], [b]) => (a < b ? -1 : 1)).map(([a, n]) => `${a}:${n}`).join(',')}`,
   );
 
   // ── gates (STRICTLY exceeds, bash parity: 100% errors with a threshold of
