@@ -670,7 +670,7 @@ async function runLane(ctx, idx, deadline) {
         const r = await doSpin(ctx, state);
         if (r.substituted) await doRead(ctx, state, rng);
       } else if (action !== null) {
-        await doFullAction(ctx, state, action);
+        if ((await doFullAction(ctx, state, action)) === null) await doRead(ctx, state, rng); // an underivable/off client host must still spend its slot on a REAL read request (the wall/drain degradation shape) — never a silently burned slot
       } else {
         await doRead(ctx, state, rng);
       }
@@ -904,6 +904,8 @@ export async function runLoadtest({ env = {}, fetchFn, out, errOut, acquireDelay
     },
   };
 
+  // GO PARITY (internal/loadtest/ws.go:167-189, probeStatus): the per-game client host is PROBED ONCE at startup — a transport failure or a non-200 turns the env-config/client-config actions OFF for the whole run, never re-sent (the live run 38667921184's status=000:50 was EXACTLY those draws: the seeded mix's 8% lands on fortune-dragon.<env domain>, which has NO DNS record — never keep sending to a surface that has proven it cannot answer, GAME_WALL_CONSECUTIVE's principle). The probe is OUT of TSV/summary accounting like the broker acquisition and the gameprobe, and an off action substitutes a real read in runLane; the verdict is summary-visible as clientcfg=(on|off).
+  if (mode === 'full' && cfg.gameHost !== '') { const probe = await httpRequest(fetchFn ?? globalThis.fetch, `${cfg.gameHost}/config.json?isFun=true`, { headers: browserHeaders(`${cfg.gameHost}/`) }); if (probe.status !== 200) { fail(`client host ${cfg.gameHost} did not answer config.json (status=${String(probe.status).padStart(3, '0')}) - env-config/client-config actions are off for the rest of the run`); cfg.gameHost = ''; } }
   const startMs = Date.now();
   const deadline = startMs + cfg.dur * 1000;
   emit(`loadtest start: ${cfg.lobbyUrl} rps=${cfg.rps} lanes=${cfg.lanes} duration=${cfg.dur}s (target=${cfg.target})`);
@@ -945,7 +947,7 @@ export async function runLoadtest({ env = {}, fetchFn, out, errOut, acquireDelay
   // (none|game-path — WHY the game share dropped, when it did) and the
   // drain= verdict (none|refill-ok|refill-store|refill-failed|no-refill —
   // WHAT the wallet did when it drained, so mix=full never silently sits
-  // over a run that stopped betting). Then the three CLASSIFICATION fields: status=<code>:<count> is the run's recorded-status histogram (000-padded, ascending — the TSV's own shape), and fails=wall:W,generic:G,other:O splits the failures by BODY — W is what the wall mechanism itself would claim (isWallResponse: "Error Code: 3000" on 400/403), G the generic "Error processing your request" envelope that also wraps ordinary wallet/session/provider verdicts, O everything else (a 000 has no body) — so an err% like the live 35.3% is classifiable from ONE line, never from truncated logs. Then fail403=<action>:<n>[,<action>:<n>]* is the per-action tally of the HTTP 403s THEMSELVES — the live "WHICH action do the 152x403 land on" question (spin => WAF/per-game rejection, the read APIs => session/token expiry, spread => systemic) — only actions that saw at least one 403, alphabetical, "-" when there are none (a transport 000 has no status to tally; it stays in other=). Finally refusal=<game|none> — the spin-side refusal guard's verdict (wall='s per-game sibling): a game that refused SPIN_REFUSAL_CONSECUTIVE consecutive bet-endpoint 403s — no wall marker, no wallet/session verdict inside — had its spin slots degrade to reads for the rest of the run; appended last, no parsed field moved.
+  // over a run that stopped betting). Then the three CLASSIFICATION fields: status=<code>:<count> is the run's recorded-status histogram (000-padded, ascending — the TSV's own shape), and fails=wall:W,generic:G,other:O splits the failures by BODY — W is what the wall mechanism itself would claim (isWallResponse: "Error Code: 3000" on 400/403), G the generic "Error processing your request" envelope that also wraps ordinary wallet/session/provider verdicts, O everything else (a 000 has no body) — so an err% like the live 35.3% is classifiable from ONE line, never from truncated logs. Then fail403=<action>:<n>[,<action>:<n>]* is the per-action tally of the HTTP 403s THEMSELVES — the live "WHICH action do the 152x403 land on" question (spin => WAF/per-game rejection, the read APIs => session/token expiry, spread => systemic) — only actions that saw at least one 403, alphabetical, "-" when there are none (a transport 000 has no status to tally; it stays in other=). Then refusal=<game|none> — the spin-side refusal guard's verdict (wall='s per-game sibling): a game that refused SPIN_REFUSAL_CONSECUTIVE consecutive bet-endpoint 403s — no wall marker, no wallet/session verdict inside — had its spin slots degrade to reads for the rest of the run. Finally clientcfg=(on|off) — the client-host startup probe's verdict (ws.go probeStatus parity): off names a per-game client host that could not serve config.json — non-resolving or refusing — so its env-config/client-config draws stopped for the run (the live status=000:50 class), appended last, no parsed field moved.
   const sent = records.length, statusHist = records.reduce((m, r) => ((m[r.status] = (m[r.status] ?? 0) + 1), m), {});
   const okCount = records.filter((r) => r.status >= 200 && r.status < 300).length;
   const failCount = sent - okCount;
@@ -961,7 +963,7 @@ export async function runLoadtest({ env = {}, fetchFn, out, errOut, acquireDelay
     `summary: sent=${sent} ok=${okCount} fail=${failCount} duration=${cfg.dur} rps=${rpsPrinted} err%=${errPct.toFixed(1)} ` +
       `p50=${rank(0.5).toFixed(3)} p95=${rank(0.95).toFixed(3)} max=${sent === 0 ? '0.0' : times[times.length - 1].toFixed(3)} ` +
       `game_err%=${gErrField} minrps=${floor === null ? 'off' : floor.toFixed(1)} token=${tokenSrc} mix=${mode} ` +
-      `wall=${wall.degraded ? 'game-path' : 'none'} drain=${drain.state} status=${Object.entries(statusHist).map(([s, n]) => `${String(s).padStart(3, '0')}:${n}`).join(',')} fails=wall:${fails.wall},generic:${fails.generic},other:${fails.other} fail403=${Object.keys(fail403).length === 0 ? '-' : Object.entries(fail403).sort(([a], [b]) => (a < b ? -1 : 1)).map(([a, n]) => `${a}:${n}`).join(',')} refusal=${refusal.degraded ? refusal.game : 'none'}`,
+      `wall=${wall.degraded ? 'game-path' : 'none'} drain=${drain.state} status=${Object.entries(statusHist).map(([s, n]) => `${String(s).padStart(3, '0')}:${n}`).join(',')} fails=wall:${fails.wall},generic:${fails.generic},other:${fails.other} fail403=${Object.keys(fail403).length === 0 ? '-' : Object.entries(fail403).sort(([a], [b]) => (a < b ? -1 : 1)).map(([a, n]) => `${a}:${n}`).join(',')} refusal=${refusal.degraded ? refusal.game : 'none'} clientcfg=${cfg.gameHost === '' ? 'off' : 'on'}`,
   );
 
   // ── gates (STRICTLY exceeds, bash parity: 100% errors with a threshold of
