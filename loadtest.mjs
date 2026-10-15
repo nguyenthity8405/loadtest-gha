@@ -527,7 +527,7 @@ async function doSpin(ctx, state) {
   // Config must be loaded before spinning; fetch on demand rather than
   // skipping (Go callSpin fires config when the stake is missing).
   if (state.betSize <= 0) await doConfig(ctx, state);
-  if (state.betSize <= 0) return { substituted: true };
+  if (state.betSize <= 0) return { substituted: true }; if (ctx.refusal.degraded) return { substituted: true }; // LAST-moment re-check: the trip may land while the stake fetch above is in flight — the loop-level check runs before doSpin and cannot see across that await; a bet never dispatched is never recorded (in-flight bets keep their honest record) and the caller substitutes a real read, so the slot is spent truthfully either way
   const spunToken = ctx.token; // the token this verdict will be ABOUT
   const res = await ctx.send(spinUrl(ctx), {
     action: 'spin', method: 'POST',
@@ -665,7 +665,7 @@ async function runLane(ctx, idx, deadline) {
           action = null; // degraded to reads: substitute the slot below
         }
       }
-      if (action === 'spin' && ctx.refusal.degraded) action = null; // the game proved it refuses its bets — this slot becomes an honest read, still a real request (Go callReadOnly's shape)
+      if (action === 'spin' && ctx.refusal.degraded) action = null; // the game proved it refuses its bets — this slot becomes an honest read, still a real request (Go callReadOnly's shape). This check runs BEFORE doSpin; doSpin re-checks immediately before dispatch, because its stake-fetch await sits between this line and ctx.send (the trip can land inside that window — test-loadtest-refusal.mjs's pre-dispatch-window pin)
       if (action === 'spin') {
         const r = await doSpin(ctx, state);
         if (r.substituted) await doRead(ctx, state, rng);
@@ -918,7 +918,7 @@ export async function runLoadtest({ env = {}, fetchFn, out, errOut, acquireDelay
   // verdict before the lobby itself fails. Sequential, bounded, REPORT-ONLY
   // unless a threshold is set (the wall must be VISIBLE, not flapping the
   // workflow red). Probe requests do NOT enter the TSV/summary accounting
-  // (bash parity).
+  // (bash parity). DECISION (c) — NOT skipped when the refusal guard trips: the probe hits balonismo (the default LOADTEST_GAME_PROBE_CODE — the workflow sets none), a DIFFERENT game from the refused cfg.gameCode, and its standing failure is a 400 on the legacy paramless URL (run 38675032529: statuses="400,400,400" while refusal=fortune-dragon) — skipping would delete the only 3000-wall sensor on a false premise, and relabelling game_err%= would falsify a true count of probes sent/failed (test-loadtest-refusal.mjs pins: probes still run, target balonismo, game_err% unchanged).
   let gSent = 0, gFail = 0;
   const gStatuses = [], gBodies = [];
   if (cfg.gprobeCode === '') {
