@@ -49,6 +49,17 @@
 // fleet token: supply is broker acquisitions only — one before the run plus
 // at most ONE mid-run re-acquisition when a source=mint wallet drains.
 //
+// PER-TOKEN SPIN CAP (the operator's fleet-wide contract; the constant lives
+// in ./loadtest-config.mjs so it ships with the config surface): a token is
+// spun at most SPIN_CAP_PER_TOKEN (60) times — doSpin counts REAL spin POSTs
+// only (read actions and skipped/substituted slots never count) and its
+// PRE-DISPATCH gate at the cap fires the SAME run-scoped refill latch the
+// wallet drain uses: mint => a fresh token + epoch bump (every lane
+// re-authorizes once) and the count restarts at 0; store => the three-level
+// rule holds and the remainder reads; failure or a spent latch => honest
+// reads with the cap still enforced — never a 61st spin on the old token,
+// never a second acquisition.
+//
 // Env contract (docs/spec-20261011-gha-cron-loadtest.md — preserved from the
 // bash script unless noted):
 //   LOADTEST_TARGET             default apig.rg-lgna.com
@@ -115,6 +126,28 @@
 
 import { appendFileSync, writeFileSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
+
+// ── the ONE local import — the config/derivation module ────────────────────
+// parseConfig / deriveScheme / isIPv4 / computeReadWindow moved VERBATIM to
+// ./loadtest-config.mjs when this file reached 999/1000 lines (the
+// worker/loopdo.js split precedent). The runner repo receives the sibling
+// BESIDE this file: gha-repo-sync.sh's :114 existence gate and BOTH mirror
+// cycles (main + trigger) ship it, gha-health.sh drift-checks it, so
+// `./loadtest-config.mjs` resolves in the runner checkout exactly as it
+// does here. Proven by experiment 2026-10-16, not by reasoning: a scratch
+// directory holding ONLY the mirror set (this file + the sibling, NO
+// package.json, NO node_modules) ran `node ./loadtest.mjs` to a full
+// summary — ESM resolves a ./relative specifier against the importing
+// module's own URL with no package.json involved — while the same file
+// WITHOUT the sibling died ERR_MODULE_NOT_FOUND. The failure mode was
+// always file ABSENCE, so test-loadtest.mjs's shipping-coherence pins now
+// allow exactly this ONE sibling (and pin the sync script's shipping set
+// to carry it) instead of demanding node:-only specifiers.
+import { computeReadWindow, parseConfig, SPIN_CAP_PER_TOKEN } from './loadtest-config.mjs';
+// Re-exported so every existing importer — the node --test suites import
+// them from HERE — keeps resolving them from loadtest.mjs unchanged; no
+// test or tool ever imports the sibling directly.
+export { computeReadWindow, deriveScheme, isIPv4, parseConfig, SPIN_CAP_PER_TOKEN } from './loadtest-config.mjs';
 
 // ── the weighted mix (port of worker/mix.js — the test pins the two copies) ──
 // loadtest.mjs is mirrored into the runner repo alone (gha-repo-sync.sh ships
@@ -189,147 +222,13 @@ function browserHeaders(referer, extra = {}) {
   };
 }
 
-// ── scheme/host derivation (the ONE http-vs-https rule, from the bash) ─────
-export function isIPv4(host) {
-  const parts = String(host).split('.');
-  if (parts.length !== 4) return false;
-  return parts.every((p) => /^[0-9]+$/.test(p) && Number(p) <= 255);
-}
-
-// An IP[:port] or any explicitly ported target is http, an IP host without a
-// port is http, every other target is https. Both the lobby URL and the read
-// APIs call this, so the rule lives in exactly one place.
-export function deriveScheme(target) {
-  const t = String(target);
-  if (/:[0-9]/.test(t)) return 'http';
-  return isIPv4(t.split(':')[0]) ? 'http' : 'https';
-}
-
-// ── the UTC+7 operator-day window (Go's betsWindow, ported) ────────────────
-// start = that day 17:00:00.000Z, end = next day 16:59:59.999Z, colons
-// escaped like QueryEscape (the wire form the bash emitted). rolloverMs is
-// the NEXT operator-day start: lanes recompute the window mid-run once now
-// passes it (a run is up to 540 s, so it can straddle 17:00 UTC — Go
-// recomputes betsWindow() per call for the same reason).
-export function computeReadWindow(now = new Date()) {
-  const shifted = new Date(now.getTime() + 7 * 3600_000);
-  const dayStartMs = Date.UTC(shifted.getUTCFullYear(), shifted.getUTCMonth(), shifted.getUTCDate()) - 7 * 3600_000;
-  const pad = (n) => String(n).padStart(2, '0');
-  const day = `${shifted.getUTCFullYear()}-${pad(shifted.getUTCMonth() + 1)}-${pad(shifted.getUTCDate())}`;
-  const wire = (ms) => new Date(ms).toISOString().replace(/:/g, '%3A');
-  return {
-    day,
-    start: wire(dayStartMs),
-    end: wire(dayStartMs + 86_400_000 - 1),
-    rolloverMs: dayStartMs + 86_400_000,
-  };
-}
-
-// ── config (env contract) ─────────────────────────────────────────────────
-// Every validation mirrors the bash one-for-one: a config error is returned,
-// never thrown, and the caller exits 2 BEFORE any request.
-export function parseConfig(env) {
-  const get = (k, dflt) => (env[k] === undefined || env[k] === '' ? dflt : env[k]);
-  const err = (message) => ({ ok: false, error: message });
-
-  const target = get('LOADTEST_TARGET', 'apig.rg-lgna.com');
-  const rpsRaw = get('LOADTEST_RPS', '5');
-  const lanesRaw = get('LOADTEST_CONCURRENCY', '4');
-  const durRaw = env.LOADTEST_DURATION_SECS === undefined ? '120' : env.LOADTEST_DURATION_SECS;
-  const maxerrRaw = get('LOADTEST_MAX_ERROR_PERCENT', '50');
-  const minrpsRaw = get('LOADTEST_MIN_RPS_PERCENT', '0');
-  const gprobeCountRaw = get('LOADTEST_GAME_PROBE_COUNT', '3');
-  const gprobeScheme = get('LOADTEST_GAME_PROBE_SCHEME', 'https');
-  const gprobeHost = get('LOADTEST_GAME_PROBE_HOST', 'apig.rg-lgna.com');
-  // '-' semantics, ported: only an UNSET code gets the default; an explicitly
-  // EMPTY value is the documented probe disable.
-  const gprobeCode = env.LOADTEST_GAME_PROBE_CODE === undefined ? 'balonismo' : env.LOADTEST_GAME_PROBE_CODE;
-  // Empty (unset OR set-empty) = report-only; only a SET value gates.
-  const gprobeMaxerr = env.LOADTEST_GAME_PROBE_MAX_ERROR_PERCENT ?? '';
-
-  const isPosNum = (v) => /^[0-9]+(\.[0-9]+)?$/.test(v) && Number(v) > 0;
-  const isNonNegInt = (v) => /^[0-9]+$/.test(v);
-
-  if (!isPosNum(rpsRaw)) return err(`LOADTEST_RPS must be a positive number, got [${rpsRaw}]`);
-  if (!isNonNegInt(lanesRaw) || Number(lanesRaw) < 1) return err(`LOADTEST_CONCURRENCY must be a positive integer, got [${lanesRaw}]`);
-  if (Number(lanesRaw) > 64) return err(`LOADTEST_CONCURRENCY must be at most 64, got [${lanesRaw}]`);
-  if (!isNonNegInt(maxerrRaw)) return err(`LOADTEST_MAX_ERROR_PERCENT must be a non-negative integer, got [${maxerrRaw}]`);
-  if (!isNonNegInt(minrpsRaw)) return err(`LOADTEST_MIN_RPS_PERCENT must be a non-negative integer, got [${minrpsRaw}]`);
-  if (!isNonNegInt(gprobeCountRaw)) return err(`LOADTEST_GAME_PROBE_COUNT must be a non-negative integer, got [${gprobeCountRaw}]`);
-  if (gprobeMaxerr !== '' && !isNonNegInt(gprobeMaxerr)) return err(`LOADTEST_GAME_PROBE_MAX_ERROR_PERCENT must be a non-negative integer, got [${gprobeMaxerr}]`);
-
-  // A non-integer duration falls back to the default; sub-second clamps up,
-  // anything over the 10-minute Actions budget clamps to 540.
-  let dur = isNonNegInt(durRaw) ? Number(durRaw) : 120;
-  if (dur < 1) dur = 1;
-  if (dur > 540) dur = 540;
-
-  const tokenUrl = env.LOADTEST_TOKEN_URL ?? '';
-  const brokerSecret = env.LOADTEST_BROKER_SECRET ?? '';
-  const requireToken = get('LOADTEST_REQUIRE_TOKEN', '0') === '1';
-  // Fail fast on the combination that can only ever fail: a broker URL with
-  // REQUIRE_TOKEN=1 but no secret means the broker 401s every attempt and the
-  // run would exit 2 anyway — catch it BEFORE any request (bash parity).
-  if (tokenUrl !== '' && requireToken && brokerSecret === '') {
-    return err('LOADTEST_TOKEN_URL is set with REQUIRE_TOKEN=1 but LOADTEST_BROKER_SECRET is empty — the broker would 401 every attempt; set the secret or drop REQUIRE_TOKEN');
-  }
-
-  // Lobby derivation: both scheme and host set explicitly => they win;
-  // otherwise each derives from TARGET (an IP[:port] target IS the lobby host
-  // over http — mirror of Go's envDomain fallback; anything else derives
-  // lobby.<env domain>, e.g. apig.rg-lgna.com -> lobby.rg-lgna.com).
-  const targetHost = target.split(':')[0];
-  const scheme = env.LOADTEST_LOBBY_SCHEME || deriveScheme(target);
-  let host = env.LOADTEST_LOBBY_HOST;
-  if (!host) host = isIPv4(targetHost) ? target : `lobby.${target.includes('.') ? target.slice(target.indexOf('.') + 1) : target}`;
-  const reqPath = get('LOADTEST_PATH', '/api/v1/lobby-available-games?oc=demo&l=en');
-  const lobbyUrl = `${scheme}://${host}${reqPath}`;
-
-  // The games/read APIs live on the API host (LOADTEST_TARGET itself — Go's
-  // apiHost), NOT on the derived lobby host.
-  const readScheme = deriveScheme(target);
-  const readHost = target;
-  // The per-game client host that serves env-config.js / config.json (Go's
-  // fun.gameHost): <game>.<env domain>. No derivable domain (an IP target)
-  // => '' and those two actions are off, exactly like Go with an empty
-  // gameHost — never a request to an invented path.
-  const gameCode = get('LOADTEST_GAME_CODE', 'fortune-dragon');
-  const gameHost = isIPv4(targetHost)
-    ? ''
-    : `${readScheme}://${gameCode}.${target.includes('.') ? target.slice(target.indexOf('.') + 1) : target}`;
-
-  return {
-    ok: true,
-    cfg: {
-      target,
-      rps: Number(rpsRaw),
-      lanes: Number(lanesRaw),
-      dur,
-      maxerr: Number(maxerrRaw),
-      minrps: Number(minrpsRaw),
-      scheme,
-      host,
-      lobbyUrl,
-      lobbyFallbackUrl: `${readScheme}://${readHost}${reqPath}`,
-      reqPath,
-      log: get('LOADTEST_LOG', 'loadtest-results.tsv'),
-      gprobeCount: Number(gprobeCountRaw),
-      gprobeScheme,
-      gprobeHost,
-      gprobeCode,
-      gprobeMaxerr,
-      tokenUrl,
-      brokerSecret,
-      requireToken,
-      gameCode,
-      ocs: get('LOADTEST_OCS', 'demo'),
-      readScheme,
-      readHost,
-      gameHost,
-    },
-  };
-}
-
+// ── scheme/host derivation, the UTC+7 operator-day window, the env contract ─
+// isIPv4 / deriveScheme / computeReadWindow / parseConfig live in
+// ./loadtest-config.mjs now (the split above) — moved VERBATIM, behaviour
+// unchanged, re-exported from the import block. They are pure functions
+// with no run-time dependencies, which is exactly why they are the half
+// that could leave: everything that talks to the network, judges a
+// response or prints the summary stays in THIS file.
 // ── HTTP ──────────────────────────────────────────────────────────────────
 // One bounded request: 15 s per load-test call (the bash curl -m 15), 30 s
 // for the broker (its --max-time 30). A transport failure answers status 000
@@ -471,6 +370,9 @@ export function isWallResponse(res) {
   return !!res && (res.status === 400 || res.status === 403) && isWallBody(res.text);
 }
 
+// isDemoBetRefusal — provider error code 1305, the demo-bet refusal: "this egress may not place bets in demo mode" (2026-10-15: SPIN=0/325 while every read succeeded; the same payload answered 201 from a non-Brazil egress — the verdict keys on WHERE the request leaves, not what it sends). Go dispatches a 4xx carrying it to its OWN class ahead of every other branch (stats.go demoBetRefusal → "DEMO_1305", commits 7659177/8b1ffeb; worker/bridge.js isDemoBetRefusal is the JS port, d723540/2142cc1) because a demo refusal and a blocked egress demand OPPOSITE responses (stop rotating vs rotate): this surface counts them apart as demo1305= in the summary while they stay inside fail= (an ordinary HTTP failure for the error-rate guard — Go's own rule) and fail403= (a 1305 IS an HTTP 403: Go counts the transport-level 403 and classifies the verdict separately). BOTH gateway spellings match, gated to a 4xx exactly like Go/bridge.js, and the trailing \b keeps "Error Code: 13050" and "code":11305 from ever matching; the literal is Go's rxDemoBetCode VERBATIM (test-loadtest-go-sentinels.mjs reads it out of stats.go as text, so a phrasing change there is decided on the same change here), and none of this can reach the wall — isWallResponse above still judges "Error Code: 3000" ALONE, untouched, so a 1305 run never degrades to lobby-only and never reads as egress refused.
+export function isDemoBetRefusal(res) { const s = Number(res?.status); if (!Number.isInteger(s) || s < 400 || s >= 500) return false; return /"code"\s*:\s*"?\s*1305\b|Error\s+Code:\s*1305\b/.test(typeof res?.text === 'string' ? res.text : ''); }
+
 // SPIN_REFUSAL_CONSECUTIVE: N CONSECUTIVE bet-endpoint 403s WITHOUT the wall marker are
 // that GAME's provider verdict (docs/bugs/provider-403-game-never-banned.md — the reads
 // prove the session/egress healthy), so THAT game's spin slots become reads for the rest
@@ -542,6 +444,21 @@ async function doSpin(ctx, state) {
   // skipping (Go callSpin fires config when the stake is missing).
   if (state.betSize <= 0) await doConfig(ctx, state);
   if (state.betSize <= 0) return { substituted: true }; if (ctx.refusal.has(ctx.cfg.gameCode)) return { substituted: true }; // LAST-moment re-check: the trip may land while the stake fetch above is in flight — the loop-level check runs before doSpin and cannot see across that await; a bet never dispatched is never recorded (in-flight bets keep their honest record) and the caller substitutes a real read, so the slot is spent truthfully either way
+  // PER-TOKEN SPIN CAP gate — BEFORE the dispatch, so the cap is a hard 60:
+  // a slot that would be the 61st spin on this token first fires the SAME
+  // run-scoped refill latch the wallet drain uses (ctx.reacquire — ONE
+  // acquisition per run, shared with every lane), then re-checks whether a
+  // NEW token actually arrived: doRefill resets ctx.spins only when it
+  // replaces ctx.token, so a mint refill (count 0, mode full) dispatches the
+  // next spin on the FRESH token — its epoch bump re-authorizes every lane
+  // (syncToken) — while a store refill (mode read), a failed refill or a
+  // spent latch (count still >= cap) substitutes an honest read: never a
+  // 61st spin on the old token, never a second acquisition.
+  if (ctx.spins >= SPIN_CAP_PER_TOKEN) {
+    await ctx.reacquire();
+    if (ctx.mode !== 'full' || ctx.spins >= SPIN_CAP_PER_TOKEN) return { substituted: true };
+  }
+  ctx.spins += 1; // a REAL spin POST about to be issued with the current token: the increment is BEFORE ctx.send, so an issued-but-refused/failed (000) bet counts too — the cap counts REQUESTS ISSUED with the token; skipped slots (the substitutions above) and read actions never reach this line
   const spunToken = ctx.token; // the token this verdict will be ABOUT
   const res = await ctx.send(spinUrl(ctx), {
     action: 'spin', method: 'POST',
@@ -759,10 +676,10 @@ export async function runLoadtest({ env = {}, fetchFn, out, errOut, acquireDelay
 
   // ── recording (one TSV line per real request) ───────────────────────────
   const records = [];
-  const fails = { wall: 0, generic: 0, other: 0 }, fail403 = {}; // fails=wall/generic/other = the failure-body classes; fail403 = the per-action 403 tally (WHICH action the provider-403 lands on)
+  const fails = { wall: 0, generic: 0, other: 0 }, fail403 = {}, demo1305 = { n: 0 }; // fails=wall/generic/other = the failure-body classes; fail403 = the per-action 403 tally (WHICH action the provider-403 lands on); demo1305 = the "Error Code: 1305" verdicts counted apart as their own class (DEMO_1305 — a demo-bet refusal is a different diagnosis from a blocked egress and must stay readable as such, reported as demo1305=)
   const record = (res, action) => {
     records.push({ status: res.status, secs: res.secs });
-    if (res.status < 200 || res.status >= 300) fails[isWallResponse(res) ? 'wall' : res.text.includes('Error processing your request') ? 'generic' : 'other'] += 1; if (res.status === 403) fail403[action ?? 'unknown'] = (fail403[action ?? 'unknown'] ?? 0) + 1;
+    if (res.status < 200 || res.status >= 300) fails[isWallResponse(res) ? 'wall' : res.text.includes('Error processing your request') ? 'generic' : 'other'] += 1; if (res.status === 403) fail403[action ?? 'unknown'] = (fail403[action ?? 'unknown'] ?? 0) + 1; if (isDemoBetRefusal(res)) demo1305.n += 1; // the 4xx gate lives INSIDE isDemoBetRefusal, so a 1305-shaped success or a 5xx/304 rider is never counted
     try {
       // 3-digit status, exactly the bash TSV: curl -w %{http_code} recorded
       // 000 for a refused/timed-out request, and every consumer of
@@ -848,6 +765,7 @@ export async function runLoadtest({ env = {}, fetchFn, out, errOut, acquireDelay
       return false;
     }
     ctx.token = got.token; // the raw token lives only on the wire and in memory — never in an emitted line
+    ctx.spins = 0; // the fresh token starts its own SPIN_CAP_PER_TOKEN budget (the counter tracks the CURRENT token)
     if (got.source === 'mint') {
       drain.state = 'refill-ok';
       ctx.epoch += 1; // every lane re-authorizes once (syncToken) before its next spin
@@ -885,6 +803,7 @@ export async function runLoadtest({ env = {}, fetchFn, out, errOut, acquireDelay
     wall, refusal,
     send,
     epoch: 0, // token generation: bumped by a successful refill, synced per lane
+    spins: 0, // REAL spin POSTs issued with the CURRENT token — the SPIN_CAP_PER_TOKEN budget, reset by doRefill when a fresh token lands
     laneStates: [], // every lane's session state, so a refill can clear the drain
     reacquire,
     api: `${cfg.readScheme}://${cfg.readHost}`,
@@ -947,7 +866,7 @@ export async function runLoadtest({ env = {}, fetchFn, out, errOut, acquireDelay
   // (none|game-path — WHY the game share dropped, when it did) and the
   // drain= verdict (none|refill-ok|refill-store|refill-failed|no-refill —
   // WHAT the wallet did when it drained, so mix=full never silently sits
-  // over a run that stopped betting). Then the three CLASSIFICATION fields: status=<code>:<count> is the run's recorded-status histogram (000-padded, ascending — the TSV's own shape), and fails=wall:W,generic:G,other:O splits the failures by BODY — W is what the wall mechanism itself would claim (isWallResponse: "Error Code: 3000" on 400/403), G the generic "Error processing your request" envelope that also wraps ordinary wallet/session/provider verdicts, O everything else (a 000 has no body) — so an err% like the live 35.3% is classifiable from ONE line, never from truncated logs. Then fail403=<action>:<n>[,<action>:<n>]* is the per-action tally of the HTTP 403s THEMSELVES — the live "WHICH action do the 152x403 land on" question (spin => WAF/per-game rejection, the read APIs => session/token expiry, spread => systemic) — only actions that saw at least one 403, alphabetical, "-" when there are none (a transport 000 has no status to tally; it stays in other=). Then refusal=<game[+game…]|none> — the per-game refusal LIST's verdict (wall='s per-game sibling; Go's badGames bans more than one title): EACH game that refused SPIN_REFUSAL_CONSECUTIVE consecutive bet-endpoint 403s — no wall marker, no wallet/session verdict inside — had ITS OWN spin slots degrade to reads for the rest of the run, listed sorted and '+'-joined (one entry per refusing game, whitespace-free so every [^ ]+ parser key still holds), the run's own game named by its bare name exactly as before. Finally clientcfg=(on|off) — the client-host startup probe's verdict (ws.go probeStatus parity): off names a per-game client host that could not serve config.json — non-resolving or refusing — so its env-config/client-config draws stopped for the run (the live status=000:50 class), appended last, no parsed field moved.
+  // over a run that stopped betting). Then the three CLASSIFICATION fields: status=<code>:<count> is the run's recorded-status histogram (000-padded, ascending — the TSV's own shape), and fails=wall:W,generic:G,other:O splits the failures by BODY — W is what the wall mechanism itself would claim (isWallResponse: "Error Code: 3000" on 400/403), G the generic "Error processing your request" envelope that also wraps ordinary wallet/session/provider verdicts, O everything else (a 000 has no body) — so an err% like the live 35.3% is classifiable from ONE line, never from truncated logs. Then fail403=<action>:<n>[,<action>:<n>]* is the per-action tally of the HTTP 403s THEMSELVES — the live "WHICH action do the 152x403 land on" question (spin => WAF/per-game rejection, the read APIs => session/token expiry, spread => systemic) — only actions that saw at least one 403, alphabetical, "-" when there are none (a transport 000 has no status to tally; it stays in other=). Then refusal=<game[+game…]|none> — the per-game refusal LIST's verdict (wall='s per-game sibling; Go's badGames bans more than one title): EACH game that refused SPIN_REFUSAL_CONSECUTIVE consecutive bet-endpoint 403s — no wall marker, no wallet/session verdict inside — had ITS OWN spin slots degrade to reads for the rest of the run, listed sorted and '+'-joined (one entry per refusing game, whitespace-free so every [^ ]+ parser key still holds), the run's own game named by its bare name exactly as before. Finally clientcfg=(on|off) — the client-host startup probe's verdict (ws.go probeStatus parity): off names a per-game client host that could not serve config.json — non-resolving or refusing — so its env-config/client-config draws stopped for the run (the live status=000:50 class), holding its slot right before the newest field. And LAST, demo1305=<n> — the count of recorded 4xx responses carrying provider error code 1305 in either gateway spelling, the class Go dispatches ahead of every other branch (stats.go demoBetRefusal → "DEMO_1305", commits 7659177/8b1ffeb; worker/bridge.js isDemoBetRefusal is the JS port — this surface was the fourth, and before it a demo-mode bet refusal was indistinguishable from a blocked egress HERE). The two demand opposite responses (stop rotating vs rotate), so the verdict is counted apart from the wall (isWallResponse still judges "Error Code: 3000" alone — a 1305 run never trips the streak, never degrades to lobby-only, never reads as egress refused), while every 1305 stays INSIDE the err% it is (an ordinary HTTP failure for the error-rate guard — Go's own rule for the class) and inside fail403= (it IS an HTTP 403: Go counts the transport-level 403 and classifies the verdict separately) — a run whose only failures are 1305 reads demo1305=<n> beside fail=<n>, attributed rather than lumped. Appended LAST; no parsed field moved.
   const sent = records.length, statusHist = records.reduce((m, r) => ((m[r.status] = (m[r.status] ?? 0) + 1), m), {});
   const okCount = records.filter((r) => r.status >= 200 && r.status < 300).length;
   const failCount = sent - okCount;
@@ -963,7 +882,7 @@ export async function runLoadtest({ env = {}, fetchFn, out, errOut, acquireDelay
     `summary: sent=${sent} ok=${okCount} fail=${failCount} duration=${cfg.dur} rps=${rpsPrinted} err%=${errPct.toFixed(1)} ` +
       `p50=${rank(0.5).toFixed(3)} p95=${rank(0.95).toFixed(3)} max=${sent === 0 ? '0.0' : times[times.length - 1].toFixed(3)} ` +
       `game_err%=${gErrField} minrps=${floor === null ? 'off' : floor.toFixed(1)} token=${tokenSrc} mix=${mode} ` +
-      `wall=${wall.degraded ? 'game-path' : 'none'} drain=${drain.state} status=${Object.entries(statusHist).map(([s, n]) => `${String(s).padStart(3, '0')}:${n}`).join(',')} fails=wall:${fails.wall},generic:${fails.generic},other:${fails.other} fail403=${Object.keys(fail403).length === 0 ? '-' : Object.entries(fail403).sort(([a], [b]) => (a < b ? -1 : 1)).map(([a, n]) => `${a}:${n}`).join(',')} refusal=${refusal.list()} clientcfg=${cfg.gameHost === '' ? 'off' : 'on'}`,
+      `wall=${wall.degraded ? 'game-path' : 'none'} drain=${drain.state} status=${Object.entries(statusHist).map(([s, n]) => `${String(s).padStart(3, '0')}:${n}`).join(',')} fails=wall:${fails.wall},generic:${fails.generic},other:${fails.other} fail403=${Object.keys(fail403).length === 0 ? '-' : Object.entries(fail403).sort(([a], [b]) => (a < b ? -1 : 1)).map(([a, n]) => `${a}:${n}`).join(',')} refusal=${refusal.list()} clientcfg=${cfg.gameHost === '' ? 'off' : 'on'} demo1305=${demo1305.n}`,
   );
 
   // ── gates (STRICTLY exceeds, bash parity: 100% errors with a threshold of
@@ -985,10 +904,7 @@ export async function runLoadtest({ env = {}, fetchFn, out, errOut, acquireDelay
   return 0;
 }
 
-async function main() {
-  const code = await runLoadtest({ env: process.env, fetchFn: globalThis.fetch });
-  process.exitCode = code;
-}
+async function main() { process.exitCode = await runLoadtest({ env: process.env, fetchFn: globalThis.fetch }); } // one statement — identical behaviour, and it pays the line budget the 1305 classifier above spent
 
 // Run only when executed directly — `node --test` imports this module.
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
