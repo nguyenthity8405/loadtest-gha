@@ -388,7 +388,10 @@ export function isDemoBetRefusal(res) { const s = Number(res?.status); if (!Numb
 // prove the session/egress healthy), so THAT game's spin slots become reads for the rest
 // of the run, one-way like the wall. A "Error Code: 3000" 403 belongs to the wall streak
 // only, a wallet/session verdict at any status judges nothing (banGameOnFailure's
-// exclusion), and non-spin answers judge nothing either (the gate at noteRefusal below).
+// exclusion), a DEMO_1305 verdict judges nothing either (Go's isTokenVerdictBody arm,
+// eb92051 — the drain owns it at loadtest.mjs:489; live 2026-10-20 runs ended
+// refusal=fortune-dragon off ONE wallet's verdicts), and non-spin answers judge nothing
+// either (the gate at noteRefusal below).
 export const SPIN_REFUSAL_CONSECUTIVE = 3;
 
 // ── the per-game refusal LIST (Go's badGames — the set bans more than one title) ─────
@@ -398,7 +401,7 @@ export const SPIN_REFUSAL_CONSECUTIVE = 3;
 // and the trip cost stays N evidence bets per game: one warning per banned game, ever.
 export function makeRefusalGuard(warn = () => {}) { const streaks = new Map(), banned = new Set(); return {
   note(game, res) { if (game === '' || banned.has(game)) return; // no game key, no judgement; a banned game is never re-judged (one-way)
-    if (res.status === 403 && !isWallResponse(res) && !isSpentTokenBody(res.text) && !isSessionInvalidBody(res.text)) {
+    if (res.status === 403 && !isWallResponse(res) && !isSpentTokenBody(res.text) && !isSessionInvalidBody(res.text) && !isDemoBetRefusal(res)) {
       const n = (streaks.get(game) ?? 0) + 1;
       if (n >= SPIN_REFUSAL_CONSECUTIVE) { banned.add(game); warn(`the game ${game} refused ${SPIN_REFUSAL_CONSECUTIVE} consecutive spins (provider 403) - its spin slots become reads for the rest of the run`); } else streaks.set(game, n);
     } else streaks.set(game, 0);
