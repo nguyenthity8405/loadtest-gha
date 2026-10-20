@@ -79,6 +79,7 @@ export function parseConfig(env) {
   const durRaw = env.LOADTEST_DURATION_SECS === undefined ? '120' : env.LOADTEST_DURATION_SECS;
   const maxerrRaw = get('LOADTEST_MAX_ERROR_PERCENT', '50');
   const minrpsRaw = get('LOADTEST_MIN_RPS_PERCENT', '0');
+  const minrpsRetriesRaw = get('LOADTEST_MIN_RPS_RETRIES', '2');
   const gprobeCountRaw = get('LOADTEST_GAME_PROBE_COUNT', '3');
   const gprobeScheme = get('LOADTEST_GAME_PROBE_SCHEME', 'https');
   const gprobeHost = get('LOADTEST_GAME_PROBE_HOST', 'apig.rg-lgna.com');
@@ -104,6 +105,14 @@ export function parseConfig(env) {
   let dur = isNonNegInt(durRaw) ? Number(durRaw) : 120;
   if (dur < 1) dur = 1;
   if (dur > 540) dur = 540;
+
+  // The minrps retry-window count follows the DURATION precedent (a tuning
+  // knob, never a gate threshold): unset/empty/non-integer falls back to the
+  // default, the value clamps DOWN to 5. loadtest.mjs bounds the real
+  // exposure further — retry windows never push total load time past the
+  // 540 s Actions budget, so at duration=540 no retry fits at all.
+  let minrpsRetries = isNonNegInt(minrpsRetriesRaw) ? Number(minrpsRetriesRaw) : 2;
+  if (minrpsRetries > 5) minrpsRetries = 5;
 
   const tokenUrl = env.LOADTEST_TOKEN_URL ?? '';
   const brokerSecret = env.LOADTEST_BROKER_SECRET ?? '';
@@ -148,6 +157,7 @@ export function parseConfig(env) {
       dur,
       maxerr: Number(maxerrRaw),
       minrps: Number(minrpsRaw),
+      minrpsRetries,
       scheme,
       host,
       lobbyUrl,
