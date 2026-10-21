@@ -29,8 +29,8 @@ Run it locally (no GitHub needed):
 ```bash
 LOADTEST_RPS=5 LOADTEST_DURATION_SECS=30 node loadtest.mjs
 # point at another host, tune the pass/fail gate; an IP/hostname that is not
-# the production domain needs the lobby override (the derived
-# lobby.<env-domain> would never resolve):
+# the production domain needs the catalog override (the derived
+# apig.<env-domain> would never resolve):
 LOADTEST_TARGET=api.example.test LOADTEST_LOBBY_HOST=api.example.test \
   LOADTEST_LOBBY_SCHEME=https LOADTEST_DURATION_SECS=60 \
   LOADTEST_MAX_ERROR_PERCENT=10 node loadtest.mjs
