@@ -40,8 +40,8 @@
 // Orthogonal to (and layered ON TOP of) that rule: GAME_WALL_CONSECUTIVE
 // game-path responses carrying the WAF "Error Code: 3000" signature degrade
 // the WHOLE run to lobby-only for the remainder — GitHub's egress is walled
-// on the game path while the lobby host stays reachable
-// (docs/bug-20261012-gha-keeps-firing-a-walled-game-path.md). mix= still
+// on the game path while the CATALOG path (the apig gateway) stays
+// reachable (docs/bug-20261012-gha-keeps-firing-a-walled-game-path.md). mix= still
 // names the source-selected mode; the summary reports the degradation as
 // wall=game-path. The ORTHOGONAL spin-side refusal guard (SPIN_REFUSAL_CONSECUTIVE) is the per-game sibling: N consecutive provider-403 bet verdicts degrade that game's spin slots to reads, reported as refusal=<game[+game…]> — one entry per refusing game (Go's badGames holds more than one title).
 //
@@ -88,9 +88,13 @@
 //   LOADTEST_LOBBY_SCHEME       default derived: http for an IP[:port] target,
 //                               https otherwise (ONE rule, shared with the
 //                               read APIs — ported from bash derive_scheme)
-//   LOADTEST_LOBBY_HOST         default derived from LOADTEST_TARGET:
-//                               IP[:port] IS the lobby host over http, any
-//                               other target gets lobby.<env domain>
+//   LOADTEST_LOBBY_HOST         default derived from LOADTEST_TARGET: the
+//                               games API GATEWAY — apig.rg-lgna.com, the
+//                               "apig" sub-domain (the lobby host is dead:
+//                               it answers an HTML 403 block page, probed
+//                               2026-10-21). An IP[:port] target serves the
+//                               path itself; the sandbox family has no apig
+//                               host, so its own API host serves it there
 //   LOADTEST_PATH               default /api/v1/lobby-available-games?oc=demo&l=en
 //   LOADTEST_LOG                default loadtest-results.tsv — one
 //                               "<status>\t<time_seconds>" line per request
@@ -439,13 +443,20 @@ async function doBalance(ctx) { return ctx.send(balanceUrl(ctx), { action: 'bala
 async function doHistory(ctx) { return ctx.send(historyUrl(ctx), { action: 'history' }); }
 async function doDetails(ctx) { return ctx.send(detailsUrl(ctx), { action: 'details' }); }
 
-// doLobby hits the derived lobby host; on a TRANSPORT failure it retries the
-// apig host once — that host serves the identical catalog path (Go's
-// lobbyCatalogURLs last hop), so a DNS/dead-lobby-host blip does not eat the
-// slot. Both attempts are recorded: one TSV line per real request.
+// doLobby hits the games API gateway — apig.rg-lgna.com, the "apig"
+// sub-domain (the lobby host is dead: it answers an HTML 403 block page,
+// probed 2026-10-21). On a TRANSPORT failure it retries the configured
+// target host once — that host serves the identical catalog path (Go's
+// lobbyCatalogURLs last hop), so a DNS/dead-gateway blip does not eat the
+// slot. The retry is SKIPPED when the two URLs are the same host (the
+// default target IS the gateway): re-sending it would burn a second slot on
+// a request the first one already proved unreachable. Both attempts are
+// recorded: one TSV line per real request.
 async function doLobby(ctx) {
   const res = await ctx.send(ctx.cfg.lobbyUrl, { action: 'lobby' });
-  if (res.status === 0) return ctx.send(ctx.cfg.lobbyFallbackUrl, { action: 'lobby' });
+  if (res.status === 0 && ctx.cfg.lobbyFallbackUrl && ctx.cfg.lobbyFallbackUrl !== ctx.cfg.lobbyUrl) {
+    return ctx.send(ctx.cfg.lobbyFallbackUrl, { action: 'lobby' });
+  }
   return res;
 }
 
