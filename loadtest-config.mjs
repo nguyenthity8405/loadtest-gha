@@ -124,29 +124,53 @@ export function parseConfig(env) {
     return err('LOADTEST_TOKEN_URL is set with REQUIRE_TOKEN=1 but LOADTEST_BROKER_SECRET is empty — the broker would 401 every attempt; set the secret or drop REQUIRE_TOKEN');
   }
 
-  // Lobby derivation: both scheme and host set explicitly => they win;
-  // otherwise each derives from TARGET (an IP[:port] target IS the lobby host
-  // over http — mirror of Go's envDomain fallback; anything else derives
-  // lobby.<env domain>, e.g. apig.rg-lgna.com -> lobby.rg-lgna.com).
+  // Catalog derivation: both scheme and host set explicitly => they win;
+  // otherwise each derives from TARGET. The catalog is read from the games
+  // API GATEWAY — apig.rg-lgna.com, the "apig" sub-domain (Go's
+  // catalogHost, mirrored here): the lobby host (lobby.<env domain>) is NOT
+  // used, because it answers an HTML 403 block page from every egress
+  // measured (2026-10-21) while the gateway answers 200 on the identical
+  // path. An IP[:port] target has no sibling host family and serves the
+  // path itself; the sandbox family has no apig host
+  // (apig.sandbox.revenge-games.com does not resolve — probed 2026-10-21),
+  // so its own API host serves the catalog there.
   const targetHost = target.split(':')[0];
   const scheme = env.LOADTEST_LOBBY_SCHEME || deriveScheme(target);
+  // The family rule is Go's SUFFIX rule (envDomain in ws.go): the domain
+  // the target BELONGS to, not the part after its first label — a port-
+  // qualified target (apig.rg-lgna.com:8443) and a multi-label one
+  // (x.apig.rg-lgna.com) must derive the same family the other three
+  // surfaces do.
+  const targetDomain = targetHost.endsWith('rg-lgna.com')
+    ? 'rg-lgna.com'
+    : targetHost.endsWith('sandbox.revenge-games.com')
+      ? 'sandbox.revenge-games.com'
+      : '';
   let host = env.LOADTEST_LOBBY_HOST;
-  if (!host) host = isIPv4(targetHost) ? target : `lobby.${target.includes('.') ? target.slice(target.indexOf('.') + 1) : target}`;
+  if (!host) {
+    host = isIPv4(targetHost)
+      ? target
+      : targetDomain === 'rg-lgna.com'
+        ? `apig.${targetDomain}`
+        : target;
+  }
   const reqPath = get('LOADTEST_PATH', '/api/v1/lobby-available-games?oc=demo&l=en');
   const lobbyUrl = `${scheme}://${host}${reqPath}`;
 
   // The games/read APIs live on the API host (LOADTEST_TARGET itself — Go's
-  // apiHost), NOT on the derived lobby host.
+  // apiHost), NOT on the derived catalog host.
   const readScheme = deriveScheme(target);
   const readHost = target;
   // The per-game client host that serves env-config.js / config.json (Go's
   // fun.gameHost): <game>.<env domain>. No derivable domain (an IP target)
   // => '' and those two actions are off, exactly like Go with an empty
-  // gameHost — never a request to an invented path.
+  // gameHost — never a request to an invented path. The SAME family rule as
+  // the catalog host above (the suffix rule), so a port-qualified target
+  // cannot leak its port into the game host.
   const gameCode = get('LOADTEST_GAME_CODE', 'fortune-dragon');
-  const gameHost = isIPv4(targetHost)
+  const gameHost = isIPv4(targetHost) || !targetDomain
     ? ''
-    : `${readScheme}://${gameCode}.${target.includes('.') ? target.slice(target.indexOf('.') + 1) : target}`;
+    : `${readScheme}://${gameCode}.${targetDomain}`;
 
   return {
     ok: true,
