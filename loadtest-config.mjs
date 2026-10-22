@@ -204,3 +204,111 @@ export function parseConfig(env) {
     },
   };
 }
+
+// ── HTTP + the broker client (the seam that moved out of loadtest.mjs) ─────
+// One bounded request: 15 s per load-test call (the bash curl -m 15), 30 s
+// for the broker (its --max-time 30). A transport failure answers status 000
+// / t=0 — the bash recorded exactly that for a failed curl, so a dead target
+// inflates err% instead of hanging the lane.
+export async function httpRequest(fetchFn, url, { method = 'GET', body, headers, timeoutMs = 15000 } = {}) {
+  const started = performance.now();
+  try {
+    const init = { method, headers, signal: AbortSignal.timeout(timeoutMs) };
+    if (body !== undefined) init.body = body;
+    const resp = await fetchFn(url, init);
+    let text = '';
+    try {
+      text = await resp.text();
+    } catch {
+      // unreadable body: the STATUS still counts, the verdict body is empty
+    }
+    return { status: resp.status, text, secs: (performance.now() - started) / 1000 };
+  } catch {
+    return { status: 0, text: '', secs: 0 };
+  }
+}
+
+export const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// acquireToken: 3 bounded attempts (bash parity), retries sleeping 1x/2x the
+// delay. An unparseable or sourceless 2xx body is a FAILURE — never an
+// invented token; source must be exactly mint or store. The answer may carry
+// "spinnable" (the broker lent a NON-EXHAUSTED row that can still bet) and
+// "spins" (that row's fleet-wide count); parseBrokerAnswer owns both, and an
+// older broker that sends neither keeps the old behaviour.
+export async function acquireToken(cfg, fetchFn, delayMs) {
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const res = await httpRequest(fetchFn, cfg.tokenUrl, {
+      headers: cfg.brokerSecret ? { Authorization: `Bearer ${cfg.brokerSecret}` } : {},
+      timeoutMs: 30_000,
+    });
+    if (res.status >= 200 && res.status < 300) {
+      const got = parseBrokerAnswer(res.text);
+      if (got) return got;
+    }
+    if (attempt < 3) await sleep(attempt * delayMs);
+  }
+  return null;
+}
+
+// ── the broker protocol (the "spinnable" answer and the release) ────────────
+// The broker's /token answer grew a "spinnable" flag on 2026-10-21: when the
+// broker's own mint is refused it now lends a NON-EXHAUSTED row (one that can
+// still bet) instead of a drained one, and says so. The runner reads that
+// flag to pick its mix: a bettable token may place bets, a drained one may
+// only read. An older broker that does not send the flag keeps the old
+// behaviour (store => read), so the two can be deployed in any order.
+//
+// "spins" is the row's FLEET-WIDE count, the baseline the runner's own
+// SPIN_CAP_PER_TOKEN budget starts from: the cap counts the spins the whole
+// fleet has placed on that wallet, not the ones this run placed.
+export function parseBrokerAnswer(text) {
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  const token = typeof parsed?.token === 'string' ? parsed.token : '';
+  const source = typeof parsed?.source === 'string' ? parsed.source : '';
+  if ((source !== 'mint' && source !== 'store') || token === '') return null;
+  const spinsRaw = Number(parsed?.spins);
+  const spins = Number.isFinite(spinsRaw) && spinsRaw > 0 ? Math.floor(spinsRaw) : 0;
+  return { token, source, spinnable: parsed?.spinnable === true, spins };
+}
+
+// brokerReleaseUrl derives the release endpoint from the token URL: the same
+// broker, the SIBLING path (/token -> /release — deliberately not
+// "/token/release", so a call-counting consumer that matches on "/token"
+// still counts acquisitions only). A URL that does not end in /token has no
+// derivable sibling, so the release is skipped (the row still comes back when
+// its lease lapses).
+export function brokerReleaseUrl(tokenUrl) {
+  const url = typeof tokenUrl === 'string' ? tokenUrl : '';
+  if (!url.endsWith('/token')) return '';
+  return `${url.slice(0, -'/token'.length)}/release`;
+}
+
+// releaseLentToken hands a lent row back to the broker with the spin count
+// this run placed on it and the drain verdict, so the fleet's ledger stays
+// exact and the row returns to the pool instead of waiting out its lease.
+//
+// It is BEST-EFFORT by design: a failed release costs accuracy, never a
+// wallet (the row returns when the lease lapses), so it never throws and
+// never fails a run.
+export async function releaseLentToken(fetchFn, cfg, token, spins, drained) {
+  const url = brokerReleaseUrl(cfg?.tokenUrl ?? '');
+  if (url === '' || typeof token !== 'string' || token === '') return false;
+  const headers = { 'Content-Type': 'application/json' };
+  if (cfg?.brokerSecret) headers.Authorization = `Bearer ${cfg.brokerSecret}`;
+  try {
+    const res = await fetchFn(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ token, spins: Number.isFinite(spins) ? spins : 0, drained: drained === true }),
+    });
+    return res?.status >= 200 && res?.status < 300;
+  } catch {
+    return false;
+  }
+}
