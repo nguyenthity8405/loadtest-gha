@@ -157,11 +157,11 @@ import { pathToFileURL } from 'node:url';
 // always file ABSENCE, so test-loadtest.mjs's shipping-coherence pins now
 // allow exactly this ONE sibling (and pin the sync script's shipping set
 // to carry it) instead of demanding node:-only specifiers.
-import { computeReadWindow, parseConfig, SPIN_CAP_PER_TOKEN } from './loadtest-config.mjs';
+import { acquireToken, computeReadWindow, httpRequest, parseBrokerAnswer, parseConfig, releaseLentToken, sleep, SPIN_CAP_PER_TOKEN } from './loadtest-config.mjs';
 // Re-exported so every existing importer — the node --test suites import
 // them from HERE — keeps resolving them from loadtest.mjs unchanged; no
 // test or tool ever imports the sibling directly.
-export { computeReadWindow, deriveScheme, isIPv4, parseConfig, SPIN_CAP_PER_TOKEN } from './loadtest-config.mjs';
+export { acquireToken, computeReadWindow, deriveScheme, httpRequest, isIPv4, parseBrokerAnswer, parseConfig, releaseLentToken, sleep, SPIN_CAP_PER_TOKEN } from './loadtest-config.mjs';
 
 // ── the weighted mix (port of worker/mix.js — the test pins the two copies) ──
 // loadtest.mjs is mirrored into the runner repo alone (gha-repo-sync.sh ships
@@ -243,55 +243,13 @@ function browserHeaders(referer, extra = {}) {
 // with no run-time dependencies, which is exactly why they are the half
 // that could leave: everything that talks to the network, judges a
 // response or prints the summary stays in THIS file.
-// ── HTTP ──────────────────────────────────────────────────────────────────
-// One bounded request: 15 s per load-test call (the bash curl -m 15), 30 s
-// for the broker (its --max-time 30). A transport failure answers status 000
-// / t=0 — the bash recorded exactly that for a failed curl, so a dead target
-// inflates err% instead of hanging the lane.
-async function httpRequest(fetchFn, url, { method = 'GET', body, headers, timeoutMs = 15000 } = {}) {
-  const started = performance.now();
-  try {
-    const init = { method, headers, signal: AbortSignal.timeout(timeoutMs) };
-    if (body !== undefined) init.body = body;
-    const resp = await fetchFn(url, init);
-    let text = '';
-    try {
-      text = await resp.text();
-    } catch {
-      // unreadable body: the STATUS still counts, the verdict body is empty
-    }
-    return { status: resp.status, text, secs: (performance.now() - started) / 1000 };
-  } catch {
-    return { status: 0, text: '', secs: 0 };
-  }
-}
-
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
-// acquireToken: 3 bounded attempts (bash parity), retries sleeping 1x/2x the
-// delay. An unparseable or sourceless 2xx body is a FAILURE — never an
-// invented token; source must be exactly mint or store.
-async function acquireToken(cfg, fetchFn, delayMs) {
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    const res = await httpRequest(fetchFn, cfg.tokenUrl, {
-      headers: cfg.brokerSecret ? { Authorization: `Bearer ${cfg.brokerSecret}` } : {},
-      timeoutMs: 30_000,
-    });
-    if (res.status >= 200 && res.status < 300) {
-      try {
-        const parsed = JSON.parse(res.text);
-        const token = typeof parsed?.token === 'string' ? parsed.token : '';
-        const source = typeof parsed?.source === 'string' ? parsed.source : '';
-        if ((source === 'mint' || source === 'store') && token !== '') return { token, source };
-      } catch {
-        // fall through to the retry
-      }
-    }
-    if (attempt < 3) await sleep(attempt * delayMs);
-  }
-  return null;
-}
-
+// ── HTTP + the broker client ──────────────────────────────────────────────
+// httpRequest, sleep and acquireToken live in ./loadtest-config.mjs now (the
+// 2026-10-21 split, the second time this file hit the 1000-line cap): the
+// bounded request, the retrying broker client and the answer parser are one
+// seam — the BROKER PROTOCOL — and they are pure enough to travel with the
+// config. Everything that judges a response or prints the summary stays in
+// THIS file.
 // ── verdicts (ports of Go games.go markTokenState helpers) ─────────────────
 // A spin body says the WALLET is done: the lane keeps its token but every
 // later spin slot becomes a read (Go callReadOnly) — one doomed spin per
@@ -686,17 +644,29 @@ export async function runLoadtest({ env = {}, fetchFn, out, errOut, acquireDelay
   }
 
   // ── token acquisition and the mode decision ─────────────────────────────
-  // mint => full mix; store => read GETs; none => lobby-only. The raw token
-  // never enters an emitted line — only the SOURCE name.
+  // mint => full mix; a BETTABLE store row (the broker's "spinnable" flag)
+  // => full mix too — it is a NON-EXHAUSTED wallet, so a run that could not
+  // mint may still bet; a drained store row => read GETs; none => lobby-only.
+  // The raw token never enters an emitted line — only the SOURCE name.
   let token = '';
   let tokenSrc = 'none';
   let mode = 'lobby';
+  // The FLEET-WIDE spin count of the row in hand: the runner's own
+  // SPIN_CAP_PER_TOKEN budget starts from it (Go baselines the same way), so
+  // a borrowed row that already carries spins cannot be pushed past the cap.
+  let tokenSpins = 0;
+  // The row borrowed from the broker, if any: the broker owns the store, so
+  // the runner has no store access and hands the row back through the
+  // broker's release endpoint (with the spin count this run used).
+  let lent = null;
   if (cfg.tokenUrl !== '') {
     const got = await acquireToken(cfg, fetchFn ?? globalThis.fetch, acquireDelayMs);
     if (got) {
       token = got.token;
       tokenSrc = got.source;
-      mode = got.source === 'mint' ? 'full' : 'read';
+      tokenSpins = got.spins;
+      mode = got.source === 'mint' || got.spinnable ? 'full' : 'read';
+      if (got.source === 'store') lent = { token: got.token, spins: got.spins, spinnable: got.spinnable };
     } else if (cfg.requireToken) {
       fail('token acquisition from LOADTEST_TOKEN_URL failed and LOADTEST_REQUIRE_TOKEN=1');
       return 2;
@@ -791,6 +761,12 @@ export async function runLoadtest({ env = {}, fetchFn, out, errOut, acquireDelay
       drain.state = 'no-refill'; // no acquisition door: lobby-only by contract
       return false;
     }
+    // The row in hand is spent (its wallet drained) — hand it back with the
+    // drain verdict so the fleet does not lease a dead wallet again.
+    if (lent) {
+      await releaseLentToken(fetchFn ?? globalThis.fetch, cfg, lent.token, ctx.spins, true);
+      lent = null;
+    }
     const got = await acquireToken(cfg, fetchFn ?? globalThis.fetch, acquireDelayMs);
     if (!got) {
       drain.state = 'refill-failed';
@@ -798,22 +774,24 @@ export async function runLoadtest({ env = {}, fetchFn, out, errOut, acquireDelay
       return false;
     }
     ctx.token = got.token; // the raw token lives only on the wire and in memory — never in an emitted line
-    ctx.spins = 0; // the fresh token starts its own SPIN_CAP_PER_TOKEN budget (the counter tracks the CURRENT token)
-    if (got.source === 'mint') {
+    ctx.spins = got.spins; // the fresh row starts its own SPIN_CAP_PER_TOKEN budget, BASELINED on the fleet-wide count it already carries
+    if (got.source === 'mint' || got.spinnable) {
       drain.state = 'refill-ok';
       ctx.epoch += 1; // every lane re-authorizes once (syncToken) before its next spin
       // Fresh wallet: the old drain verdict was about the old token.
       for (const s of ctx.laneStates) s.noBalance = false;
       emit('token source=mint re-acquired after the wallet drained - resuming spins');
+      if (got.source === 'store') lent = { token: got.token, spins: got.spins, spinnable: got.spinnable };
       return true;
     }
-    // source=store: the mint-empty fallback IS read-only by design — the
-    // three-level rule holds (store => read) for the rest of the run.
+    // A DRAINED store row: read-only by design — the three-level rule holds
+    // (store => read) for the rest of the run.
     drain.state = 'refill-store';
     tokenSrc = got.source;
     mode = 'read';
     ctx.mode = 'read';
     emit('token source=store re-acquired after the wallet drained - reading for the rest of the run');
+    if (got.source === 'store') lent = { token: got.token, spins: got.spins, spinnable: got.spinnable };
     return false;
   };
   const reacquire = () => {
@@ -836,7 +814,7 @@ export async function runLoadtest({ env = {}, fetchFn, out, errOut, acquireDelay
     wall, refusal,
     send,
     epoch: 0, // token generation: bumped by a successful refill, synced per lane
-    spins: 0, // REAL spin POSTs issued with the CURRENT token — the SPIN_CAP_PER_TOKEN budget, reset by doRefill when a fresh token lands
+    spins: tokenSpins, // REAL spin POSTs issued with the CURRENT token — the SPIN_CAP_PER_TOKEN budget (BASELINED on the row's fleet-wide count), reset by doRefill when a fresh token lands
     laneStates: [], // every lane's session state, so a refill can clear the drain
     reacquire,
     api: `${cfg.readScheme}://${cfg.readHost}`,
@@ -926,6 +904,20 @@ export async function runLoadtest({ env = {}, fetchFn, out, errOut, acquireDelay
       gBodies.push(res.text.replace(/[\n\r\t]/g, ' ').slice(0, 40) || '-');
     }
     log(`gameprobe: sent=${gSent} ok=${gSent - gFail} fail=${gFail} statuses="${gStatuses.join(',')}" bodies="${gBodies.length > 0 ? gBodies.join(',') : '-'}"`);
+  }
+
+  // ── hand the borrowed row back ───────────────────────────────────────────
+  // The broker owns the store, so the runner cannot return a borrowed row
+  // itself — it tells the broker how many spins the run placed on it and
+  // whether the wallet drained, and the broker records that and frees the
+  // row. A row that did not drain goes back BETTABLE (its remaining balance
+  // is fleet supply again); one that drained goes back drained, so no
+  // machine leases a dead wallet. Best-effort: a failed release costs
+  // accuracy, never the wallet — the lease lapses and the row returns anyway.
+  if (lent) {
+    const drained = !lent.spinnable || ctx.laneStates.some((s) => s.noBalance);
+    await releaseLentToken(fetchFn ?? globalThis.fetch, cfg, lent.token, ctx.spins, drained);
+    lent = null;
   }
 
   // ── summary ─────────────────────────────────────────────────────────────
