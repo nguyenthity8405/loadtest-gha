@@ -169,21 +169,22 @@ export { acquireToken, computeReadWindow, deriveScheme, httpRequest, isIPv4, par
 // table is a PORT and scripts/tests/test-loadtest.mjs asserts it equals the
 // Worker's — one table, three surfaces (Go types.go W*, worker/mix.js, here).
 //
-// Weight sits on the READ APIs rather than on minting: a pooled token is only
-// replaced when a spin reports an exhausted wallet, so new-token is a
-// last-resort refill and not traffic. WSS is absent by design: it runs
+// The mix is BET-FIRST (the operator's 2026-10-26 direction, mirrored from
+// Go): spin is the majority on its own, the reads together are smaller than
+// it, and new-token carries real weight so a wallet the gateway refused can
+// be replaced while the run keeps betting. WSS is absent by design: it runs
 // outside the HTTP budget in Go (WSSPercent), so every slot here is HTTP.
 export const ACTIONS = [
-  { name: 'spin', weight: 31 },
-  { name: 'config', weight: 15 },
-  { name: 'balance', weight: 11 },
-  { name: 'auth', weight: 9 },
-  { name: 'history', weight: 9 },
-  { name: 'details', weight: 9 },
-  { name: 'lobby', weight: 7 },
+  { name: 'spin', weight: 55 },
+  { name: 'config', weight: 5 },
+  { name: 'balance', weight: 5 },
+  { name: 'auth', weight: 5 },
+  { name: 'history', weight: 4 },
+  { name: 'details', weight: 4 },
+  { name: 'lobby', weight: 4 },
   { name: 'env-config', weight: 4 },
   { name: 'client-config', weight: 4 },
-  { name: 'new-token', weight: 1 },
+  { name: 'new-token', weight: 10 },
 ];
 
 export const TOTAL_WEIGHT = ACTIONS.reduce((sum, a) => sum + a.weight, 0); // 100
